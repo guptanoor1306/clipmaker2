@@ -433,45 +433,47 @@ def generate_clip_ffmpeg(video_path: str, start_time: float, end_time: float, ma
             original_ratio = original_width / original_height
             
             if original_ratio > target_ratio:
-                # Horizontal video - need to crop and scale properly
-                # Method 1: Crop from center to get 9:16 ratio, then scale up to fill
+                # Horizontal video - crop from center and scale
+                # Simplified approach: crop to 9:16 ratio then scale
                 crop_height = original_height
                 crop_width = int(crop_height * target_ratio)
                 crop_x = (original_width - crop_width) // 2
                 crop_y = 0
                 
-                # Use scale filter to fill the entire 1080x1920 frame
+                # Simplified FFmpeg command
                 cmd = [
                     ffmpeg_exe, '-y', 
                     '-i', video_path,
                     '-ss', str(start_time),
                     '-t', str(duration),
-                    '-vf', f'crop={crop_width}:{crop_height}:{crop_x}:{crop_y},scale={target_width}:{target_height}:force_original_aspect_ratio=increase,crop={target_width}:{target_height}',
-                    '-c:a', 'aac',
+                    '-vf', f'crop={crop_width}:{crop_height}:{crop_x}:{crop_y},scale={target_width}:{target_height}',
+                    '-c:a', 'aac', '-b:a', '128k',
                     '-c:v', 'libx264',
-                    '-preset', preset,
-                    '-crf', crf,
-                    '-r', '30',  # Force 30fps
+                    '-preset', 'veryfast',  # Even faster than ultrafast but more stable
+                    '-crf', '28',
+                    '-movflags', '+faststart',  # For better web compatibility
+                    '-avoid_negative_ts', 'make_zero',  # Fix timestamp issues
                     temp_clip.name
                 ]
-                progress_placeholder.info(f"📐 Cropping center {crop_width}x{crop_height} and scaling to fill 1080x1920")
+                progress_placeholder.info(f"📐 Cropping center {crop_width}x{crop_height} and scaling to {target_width}x{target_height}")
                 
             else:
-                # Already vertical or square - scale to fill 1080x1920
+                # Already vertical or square - just scale
                 cmd = [
                     ffmpeg_exe, '-y',
                     '-i', video_path,
                     '-ss', str(start_time),
                     '-t', str(duration),
-                    '-vf', f'scale={target_width}:{target_height}:force_original_aspect_ratio=increase,crop={target_width}:{target_height}',
-                    '-c:a', 'aac',
+                    '-vf', f'scale={target_width}:{target_height}',
+                    '-c:a', 'aac', '-b:a', '128k',
                     '-c:v', 'libx264',
-                    '-preset', preset,
-                    '-crf', crf,
-                    '-r', '30',
+                    '-preset', 'veryfast',
+                    '-crf', '28',
+                    '-movflags', '+faststart',
+                    '-avoid_negative_ts', 'make_zero',
                     temp_clip.name
                 ]
-                progress_placeholder.info(f"📱 Scaling to fill 1080x1920 shorts format")
+                progress_placeholder.info(f"📱 Scaling to {target_width}x{target_height} shorts format")
         else:
             # Horizontal clip - keep original aspect ratio
             cmd = [
@@ -479,60 +481,64 @@ def generate_clip_ffmpeg(video_path: str, start_time: float, end_time: float, ma
                 '-i', video_path,
                 '-ss', str(start_time),
                 '-t', str(duration),
-                '-c:a', 'aac',
+                '-c:a', 'aac', '-b:a', '128k',
                 '-c:v', 'libx264',
-                '-preset', preset,
-                '-crf', crf,
+                '-preset', 'veryfast',
+                '-crf', '28',
+                '-movflags', '+faststart',
+                '-avoid_negative_ts', 'make_zero',
                 temp_clip.name
             ]
             progress_placeholder.info(f"📺 Creating horizontal clip...")
         
-        # Calculate reasonable timeout
-        timeout_seconds = max(60, min(300, duration * 6))  # More time for vertical processing
+        # Reduce timeout for better user experience
+        timeout_seconds = max(45, min(180, duration * 3))  # 3x duration, max 3 minutes
         
         progress_placeholder.info(f"⚙️ Processing {duration:.1f}s clip (timeout: {timeout_seconds}s)...")
         
-        # Execute FFmpeg with timeout and progress tracking
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        
-        # Monitor progress
+        # Execute FFmpeg with better error handling
         try:
-            stdout, stderr = process.communicate(timeout=timeout_seconds)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
             
             elapsed = time.time() - start_generation_time
             
-            if process.returncode != 0:
+            if result.returncode != 0:
                 progress_placeholder.error(f"❌ FFmpeg failed after {elapsed:.1f}s")
                 # Show more detailed error for debugging
-                st.error(f"FFmpeg command failed. Error output: {stderr[-800:]}")
-                raise Exception(f"FFmpeg failed: {stderr[-500:]}")
+                error_details = result.stderr[-800:] if result.stderr else "No error details"
+                st.error(f"FFmpeg error details: {error_details}")
+                raise Exception(f"FFmpeg failed with return code {result.returncode}")
             
-            if not os.path.isfile(temp_clip.name) or os.path.getsize(temp_clip.name) < 1000:
-                progress_placeholder.error(f"❌ Output file invalid after {elapsed:.1f}s")
-                raise Exception("Output file not created or too small")
+            if not os.path.isfile(temp_clip.name):
+                raise Exception("Output file was not created")
             
-            file_size_mb = os.path.getsize(temp_clip.name) / (1024 * 1024)
+            file_size = os.path.getsize(temp_clip.name)
+            if file_size < 1000:  # Less than 1KB
+                raise Exception(f"Output file too small ({file_size} bytes)")
             
-            # Verify the output dimensions
+            file_size_mb = file_size / (1024 * 1024)
+            
+            # Verify the output dimensions if possible
             try:
                 verify_info = get_video_info(temp_clip.name, ffmpeg_exe)
                 actual_width = verify_info.get('width', 0)
                 actual_height = verify_info.get('height', 0)
                 
-                if make_vertical and (actual_width != 1080 or actual_height != 1920):
-                    st.warning(f"⚠️ Output dimensions: {actual_width}x{actual_height} (expected 1080x1920)")
+                if make_vertical and actual_width > 0 and actual_height > 0:
+                    if actual_width == 1080 and actual_height == 1920:
+                        progress_placeholder.success(f"✅ Perfect shorts format: {actual_width}x{actual_height} in {elapsed:.1f}s ({file_size_mb:.1f}MB)")
+                    else:
+                        progress_placeholder.success(f"✅ Clip created: {actual_width}x{actual_height} in {elapsed:.1f}s ({file_size_mb:.1f}MB)")
                 else:
-                    progress_placeholder.success(f"✅ Perfect shorts format: {actual_width}x{actual_height} in {elapsed:.1f}s ({file_size_mb:.1f}MB)")
+                    progress_placeholder.success(f"✅ Clip generated in {elapsed:.1f}s ({file_size_mb:.1f}MB)")
             except:
                 progress_placeholder.success(f"✅ Clip generated in {elapsed:.1f}s ({file_size_mb:.1f}MB)")
             
             return temp_clip.name
             
         except subprocess.TimeoutExpired:
-            process.kill()
-            elapsed = time.time() - start_generation_time
-            progress_placeholder.error(f"⏰ FFmpeg timed out after {elapsed:.1f}s")
-            raise Exception(f"FFmpeg timed out after {timeout_seconds}s - try a shorter clip")
+            progress_placeholder.error(f"⏰ FFmpeg timed out after {timeout_seconds}s")
+            raise Exception(f"Processing timed out after {timeout_seconds}s - try shorter clips or use instructions mode")
         
     except Exception as e:
         # Clean up on failure
@@ -901,6 +907,10 @@ def main():
         if not video_path or not os.path.isfile(video_path):
             st.error("Video file not found. Please reload your video.")
             return
+        
+        # Clear any old transcription state
+        if 'transcription_choice' in st.session_state:
+            del st.session_state['transcription_choice']
             
         # Progress tracking
         progress_bar = st.progress(0)
@@ -1213,9 +1223,9 @@ def main():
     # Reset button with confirmation
     st.sidebar.markdown("---")
     if st.sidebar.button("🔄 Start Over", help="Clear all data and start fresh"):
-        # Clear all session state
+        # Clear all session state including any old transcription choices
         for key in list(st.session_state.keys()):
-            if key not in ['app_initialized']:  # Keep app initialization
+            if key not in ['app_initialized', 'show_drive_warning']:  # Keep only essential app state
                 del st.session_state[key]
         st.session_state['current_step'] = 'upload'
         st.rerun()
