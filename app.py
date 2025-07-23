@@ -1147,17 +1147,13 @@ def main():
         for clip_info in st.session_state.generated_clips:
             # Create expandable section for each clip
             with st.expander(f"🎬 Clip {clip_info['index']} - Score: {clip_info['score']}/100", expanded=False):
-                video_col, details_col = st.columns([1.2, 1])
+                video_col, details_col = st.columns([1, 1.5])
                 
                 with video_col:
                     if os.path.isfile(clip_info["path"]):
-                        st.video(clip_info["path"])
+                        st.video(clip_info["path"], start_time=0)
                     else:
                         st.error("❌ Clip file no longer available")
-                        
-                    # Caption below video
-                    with st.expander("📝 Suggested Caption", expanded=False):
-                        st.code(clip_info["caption"], language="text")
                 
                 with details_col:
                     # Clip details
@@ -1170,6 +1166,10 @@ def main():
                     💾 **Size:** {clip_info['file_size']}
                     """
                     st.markdown(detail_info)
+                    
+                    # Caption section
+                    with st.expander("📝 Suggested Caption", expanded=False):
+                        st.code(clip_info["caption"], language="text")
                     
                     # Analysis sections
                     with st.expander("🪝 Hook Analysis", expanded=False):
@@ -1197,8 +1197,6 @@ def main():
                             )
                     else:
                         st.error("❌ File no longer available")
-            
-            st.markdown("---")
 
     # Reset button
     if st.sidebar.button("🔄 Start Over"):
