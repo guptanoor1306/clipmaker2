@@ -924,8 +924,6 @@ def main():
         try:
             if ffmpeg_available:
                 transcript = transcribe_audio_ffmpeg(video_path, client, ffmpeg_path)
-                if not transcript:  # User chose option but hasn't completed choice
-                    return
             else:
                 # Simple fallback transcription
                 st.warning("Limited transcription without FFmpeg")
