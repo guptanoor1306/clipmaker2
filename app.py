@@ -725,6 +725,15 @@ def main():
     st.title("🎬 Long‑form to Short‑form ClipMaker")
     st.markdown("Transform your long-form content into viral short-form clips (20-59s) with compelling hooks!")
 
+    # Initialize session state for better state management
+    if 'app_initialized' not in st.session_state:
+        st.session_state.app_initialized = True
+        st.session_state.current_step = 'upload'  # upload, analyzing, results, generating
+    
+    # Preserve state across downloads
+    if 'preserve_state' not in st.session_state:
+        st.session_state.preserve_state = True
+
     # Load & validate API Key
     API_KEY = get_api_key()
     if not API_KEY:
@@ -774,22 +783,18 @@ def main():
         result = subprocess.run([ffmpeg_path, '-version'], capture_output=True, timeout=5)
         if result.returncode == 0:
             ffmpeg_available = True
-            st.sidebar.success("✅ FFmpeg available (imageio-ffmpeg)")
         else:
             raise Exception("FFmpeg test failed")
             
     except Exception as e:
-        st.sidebar.warning("⚠️ imageio-ffmpeg not available, trying system FFmpeg")
-        
         # Fallback to system FFmpeg
         try:
             result = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5)
             if result.returncode == 0:
                 ffmpeg_available = True
                 ffmpeg_path = 'ffmpeg'
-                st.sidebar.success("✅ System FFmpeg available")
         except:
-            st.sidebar.error("❌ No FFmpeg found")
+            pass
             
     if not ffmpeg_available:
         st.sidebar.markdown("""
@@ -814,21 +819,15 @@ def main():
             value=True,
             help="Convert to vertical format perfect for Instagram Reels"
         )
-        
-        if make_vertical:
-            st.sidebar.success("📱 Perfect 1080x1920 Instagram format")
-        else:
-            st.sidebar.info("📺 Original horizontal format")
 
     # Video source
     st.sidebar.subheader("📹 Video Source")
-    st.sidebar.info("💡 **Direct upload recommended** to avoid rate limits!")
     
     # Direct upload (primary option)
     uploaded = st.sidebar.file_uploader(
         "📁 Upload video file", 
         type=["mp4", "mov", "mkv", "avi", "webm"],
-        help="Direct upload is most reliable"
+        help="Recommended: Upload directly for best reliability"
     )
     
     video_path = None
@@ -959,6 +958,7 @@ def main():
         # Store segments in session state
         st.session_state['ai_segments'] = segments
         st.session_state['video_analyzed'] = True
+        st.session_state['current_step'] = 'results'
         progress_bar.progress(100)
         status_text.text("✅ Analysis complete! Select clips below.")
         
@@ -988,8 +988,9 @@ def main():
                         st.rerun()
                 
                 if generate_button:
-                    # Reset cancel flag
+                    # Reset cancel flag and set generating state
                     st.session_state['cancel_generation'] = False
+                    st.session_state['current_step'] = 'generating'
                     
                     st.markdown("---")
                     st.header("🎬 Generating Selected Clips")
@@ -1088,6 +1089,8 @@ def main():
                                 st.markdown("---")
                                 with open(clip_info["path"], "rb") as file:
                                     file_extension = "vertical" if make_vertical else "horizontal"
+                                    # Use a unique key that includes timestamp to prevent rerun
+                                    download_key = f"download_{clip_info['index']}_{int(time.time())}"
                                     st.download_button(
                                         label="⬇️ Download Clip",
                                         data=file,
@@ -1095,7 +1098,8 @@ def main():
                                         mime="video/mp4",
                                         use_container_width=True,
                                         type="primary",
-                                        key=f"download_{clip_info['index']}"
+                                        key=download_key,
+                                        on_click=None  # Prevent callback that might cause rerun
                                     )
                             
                             st.markdown("---")
@@ -1108,6 +1112,7 @@ def main():
                         progress_bar.progress(i / len(selected_segments))
                     
                     status_text.text("✅ All selected clips processed!")
+                    st.session_state['current_step'] = 'completed'
                     
                     # Summary
                     successful_clips = len(st.session_state.generated_clips)
@@ -1147,17 +1152,13 @@ def main():
         for clip_info in st.session_state.generated_clips:
             # Create expandable section for each clip
             with st.expander(f"🎬 Clip {clip_info['index']} - Score: {clip_info['score']}/100", expanded=False):
-                video_col, details_col = st.columns([1.2, 1])
+                video_col, details_col = st.columns([1, 1.5])
                 
                 with video_col:
                     if os.path.isfile(clip_info["path"]):
-                        st.video(clip_info["path"])
+                        st.video(clip_info["path"], start_time=0)
                     else:
                         st.error("❌ Clip file no longer available")
-                        
-                    # Caption below video
-                    with st.expander("📝 Suggested Caption", expanded=False):
-                        st.code(clip_info["caption"], language="text")
                 
                 with details_col:
                     # Clip details
@@ -1170,6 +1171,10 @@ def main():
                     💾 **Size:** {clip_info['file_size']}
                     """
                     st.markdown(detail_info)
+                    
+                    # Caption section
+                    with st.expander("📝 Suggested Caption", expanded=False):
+                        st.code(clip_info["caption"], language="text")
                     
                     # Analysis sections
                     with st.expander("🪝 Hook Analysis", expanded=False):
@@ -1186,6 +1191,8 @@ def main():
                     if os.path.isfile(clip_info["path"]):
                         with open(clip_info["path"], "rb") as file:
                             file_extension = "vertical" if make_vertical else "horizontal"
+                            # Use unique key to prevent state issues
+                            persistent_key = f"persistent_download_{clip_info['index']}_{hash(clip_info['path'])}"
                             st.download_button(
                                 label="⬇️ Download Clip",
                                 data=file,
@@ -1193,19 +1200,20 @@ def main():
                                 mime="video/mp4",
                                 use_container_width=True,
                                 type="primary",
-                                key=f"persistent_download_{clip_info['index']}"
+                                key=persistent_key,
+                                on_click=None
                             )
                     else:
                         st.error("❌ File no longer available")
-            
-            st.markdown("---")
 
-    # Reset button
-    if st.sidebar.button("🔄 Start Over"):
+    # Reset button with confirmation
+    st.sidebar.markdown("---")
+    if st.sidebar.button("🔄 Start Over", help="Clear all data and start fresh"):
         # Clear all session state
         for key in list(st.session_state.keys()):
-            if key.startswith(('ai_segments', 'video_analyzed', 'generated_clips', 'selected_clips')):
+            if key not in ['app_initialized']:  # Keep app initialization
                 del st.session_state[key]
+        st.session_state['current_step'] = 'upload'
         st.rerun()
 
 
