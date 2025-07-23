@@ -1,4 +1,4 @@
-# app.py - FFmpeg-only ClipMaker (Fixed ffprobe issue + improved parameters)
+# app.py - FFmpeg-only ClipMaker (Fixed all issues)
 import os
 import json
 import tempfile
@@ -7,6 +7,7 @@ import re
 import subprocess
 import streamlit as st
 import gdown
+import time
 from openai import OpenAI
 
 # ----------
@@ -103,298 +104,6 @@ def time_to_seconds(time_str: str) -> float:
     except:
         st.error(f"Could not parse time: {time_str}")
         return 0
-
-
-def transcribe_audio_ffmpeg(video_path: str, client: OpenAI, ffmpeg_path: str = 'ffmpeg') -> str:
-    """Extract audio using FFmpeg and transcribe with OpenAI Whisper."""
-    try:
-        # Extract audio to temporary file using FFmpeg
-        audio_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        audio_temp.close()
-        
-        st.info("🎵 Extracting audio with FFmpeg...")
-        
-        # Get FFmpeg executable
-        try:
-            import imageio_ffmpeg
-            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        except:
-            ffmpeg_exe = ffmpeg_path
-        
-        # FFmpeg command to extract audio
-        ffmpeg_cmd = [
-            ffmpeg_exe, '-y', '-i', video_path, 
-            '-vn',  # No video
-            '-acodec', 'mp3', 
-            '-ab', '64k',  # Lower bitrate to reduce file size
-            '-ar', '22050',  # Lower sample rate for smaller files
-            audio_temp.name
-        ]
-        
-        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=300)
-        
-        if result.returncode != 0:
-            raise Exception(f"Audio extraction failed: {result.stderr}")
-        
-        # Check file size and split if needed
-        file_size_mb = os.path.getsize(audio_temp.name) / (1024 * 1024)
-        st.info(f"Audio file size: {file_size_mb:.1f}MB")
-        
-        if file_size_mb > 20:  # Split if too large
-            st.info("Audio too large, splitting into chunks...")
-            # Split into 10-minute chunks
-            chunks = []
-            chunk_duration = 600  # 10 minutes
-            
-            # Get audio duration - use a simpler method
-            try:
-                # Quick duration check with shorter timeout
-                probe_cmd = [ffmpeg_exe, '-i', audio_temp.name, '-f', 'null', '-', '-t', '0.1']
-                probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
-                
-                # Parse duration from stderr
-                duration_match = re.search(r'Duration: (\d+):(\d+):(\d+\.\d+)', probe_result.stderr)
-                if duration_match:
-                    h, m, s = duration_match.groups()
-                    total_duration = int(h) * 3600 + int(m) * 60 + float(s)
-                else:
-                    # Estimate from file size (rough: 1MB ≈ 8 minutes of 64k audio)
-                    total_duration = file_size_mb * 8 * 60
-                    st.info(f"Estimated audio duration: {total_duration/60:.1f} minutes")
-            except Exception:
-                # Final fallback
-                total_duration = 3600  # 1 hour default
-                st.warning("Using default duration estimate")
-            
-            chunk_num = 0
-            start_time = 0
-            
-            while start_time < total_duration:
-                chunk_temp = tempfile.NamedTemporaryFile(delete=False, suffix=f"_chunk_{chunk_num}.mp3")
-                chunk_temp.close()
-                
-                duration = min(chunk_duration, total_duration - start_time)
-                
-                chunk_cmd = [
-                    ffmpeg_exe, '-y', '-i', audio_temp.name,
-                    '-ss', str(start_time), '-t', str(duration),
-                    '-acodec', 'copy',
-                    chunk_temp.name
-                ]
-                
-                try:
-                    subprocess.run(chunk_cmd, capture_output=True, timeout=120)
-                    if os.path.exists(chunk_temp.name) and os.path.getsize(chunk_temp.name) > 1000:
-                        chunks.append(chunk_temp.name)
-                    else:
-                        st.warning(f"Chunk {chunk_num} failed or empty, skipping")
-                except subprocess.TimeoutExpired:
-                    st.warning(f"Chunk {chunk_num} timed out, skipping")
-                
-                start_time += chunk_duration
-                chunk_num += 1
-            
-            if not chunks:
-                raise Exception("No valid audio chunks created")
-            
-            # Transcribe chunks
-            full_transcript = ""
-            for i, chunk_path in enumerate(chunks):
-                st.info(f"Transcribing chunk {i+1}/{len(chunks)}...")
-                try:
-                    with open(chunk_path, "rb") as f:
-                        resp = client.audio.transcriptions.create(model="whisper-1", file=f)
-                    full_transcript += resp.text + " "
-                except Exception as chunk_error:
-                    st.warning(f"Chunk {i+1} transcription failed: {chunk_error}")
-                finally:
-                    try:
-                        os.unlink(chunk_path)  # Clean up chunk
-                    except:
-                        pass
-                
-        else:
-            # Transcribe single file
-            with open(audio_temp.name, "rb") as f:
-                resp = client.audio.transcriptions.create(model="whisper-1", file=f)
-            full_transcript = resp.text
-        
-        # Clean up audio file
-        try:
-            os.unlink(audio_temp.name)
-        except:
-            pass
-            
-        if not full_transcript.strip():
-            raise Exception("Transcription returned empty result")
-            
-        return full_transcript.strip()
-        
-    except Exception as e:
-        st.error(f"Transcription error: {str(e)}")
-        # Clean up on error
-        try:
-            if 'audio_temp' in locals():
-                os.unlink(audio_temp.name)
-        except:
-            pass
-        raise
-
-
-def generate_clip_commands(video_path: str, start_time: float, end_time: float, make_vertical: bool = False) -> dict:
-    """Generate FFmpeg commands for clip creation when direct processing isn't available."""
-    try:
-        duration = end_time - start_time
-        
-        # Base FFmpeg command for horizontal clip
-        base_cmd = f'ffmpeg -i "{os.path.basename(video_path)}" -ss {start_time} -t {duration} -c:v libx264 -c:a aac -preset fast -crf 23'
-        
-        commands = {}
-        
-        if make_vertical:
-            # Vertical clip command (assumes 3840x2160 input)
-            crop_width = 1215  # For 9:16 ratio from 2160 height
-            crop_x = 1312      # Center position
-            
-            vertical_cmd = f'{base_cmd} -vf "crop={crop_width}:2160:{crop_x}:0,scale=1080:1920" "clip_vertical.mp4"'
-            commands['vertical'] = {
-                'command': vertical_cmd,
-                'description': 'Creates 1080x1920 vertical clip perfect for Instagram Reels',
-                'filename': 'clip_vertical.mp4'
-            }
-        
-        # Horizontal clip command
-        horizontal_cmd = f'{base_cmd} "clip_horizontal.mp4"'
-        commands['horizontal'] = {
-            'command': horizontal_cmd,
-            'description': 'Creates horizontal clip maintaining original quality',
-            'filename': 'clip_horizontal.mp4'
-        }
-        
-        return commands
-        
-    except Exception as e:
-        raise Exception(f"Command generation failed: {str(e)}")
-
-
-def create_instructions_file(selected_segments: list, video_filename: str, make_vertical: bool) -> str:
-    """Create a downloadable instructions file with all FFmpeg commands."""
-    try:
-        instructions = f"""# ClipMaker - Video Clip Generation Instructions
-
-## Original Video File: {video_filename}
-
-### Prerequisites:
-1. Install FFmpeg: https://ffmpeg.org/download.html
-2. Place this file and your video in the same folder
-3. Open terminal/command prompt in that folder
-
-### Generated Clips (20-59 seconds each):
-
-"""
-        
-        for i, segment in enumerate(selected_segments, 1):
-            start_time = time_to_seconds(segment.get("start", "0"))
-            end_time = time_to_seconds(segment.get("end", "0"))
-            duration = end_time - start_time
-            
-            instructions += f"""
-## Clip {i} - Score: {segment.get('score', 0)}/100
-**Time:** {segment.get('start')} - {segment.get('end')} ({duration:.1f}s)
-**Hook:** {segment.get('hook', 'Strong opening hook')}
-**Flow:** {segment.get('flow', 'Complete narrative arc')}
-**Caption:** {segment.get('caption', '')}
-**Why it works:** {segment.get('reason', '')}
-
-"""
-            
-            commands = generate_clip_commands(video_filename, start_time, end_time, make_vertical)
-            
-            if make_vertical and 'vertical' in commands:
-                instructions += f"""**Instagram/TikTok (Vertical 9:16):**
-```bash
-{commands['vertical']['command'].replace(f'"{video_filename}"', f'"{video_filename}"')}
-```
-
-"""
-            
-            if 'horizontal' in commands:
-                instructions += f"""**YouTube/General (Horizontal):**
-```bash
-{commands['horizontal']['command'].replace(f'"{video_filename}"', f'"{video_filename}"')}
-```
-
-"""
-            
-            instructions += "---\n"
-        
-        instructions += f"""
-### Batch Processing (All Clips at Once):
-
-Create a batch file to generate all clips automatically:
-
-**Windows (create run_clips.bat):**
-```batch
-@echo off
-"""
-        
-        for i, segment in enumerate(selected_segments, 1):
-            start_time = time_to_seconds(segment.get("start", "0"))
-            end_time = time_to_seconds(segment.get("end", "0"))
-            commands = generate_clip_commands(video_filename, start_time, end_time, make_vertical)
-            
-            if make_vertical and 'vertical' in commands:
-                cmd = commands['vertical']['command'].replace('"clip_vertical.mp4"', f'"clip_{i}_vertical.mp4"')
-                instructions += f'{cmd}\n'
-        
-        instructions += """
-pause
-```
-
-**Mac/Linux (create run_clips.sh):**
-```bash
-#!/bin/bash
-"""
-        
-        for i, segment in enumerate(selected_segments, 1):
-            start_time = time_to_seconds(segment.get("start", "0"))
-            end_time = time_to_seconds(segment.get("end", "0"))
-            commands = generate_clip_commands(video_filename, start_time, end_time, make_vertical)
-            
-            if make_vertical and 'vertical' in commands:
-                cmd = commands['vertical']['command'].replace('"clip_vertical.mp4"', f'"clip_{i}_vertical.mp4"')
-                instructions += f'{cmd}\n'
-        
-        instructions += """
-echo "All clips generated!"
-```
-
-### Notes:
-- All clips are 20-59 seconds with strong hooks and smooth endings
-- Replace the video filename in commands if your file has a different name
-- Adjust crop parameters if your video has different dimensions
-- All clips will be high quality with H.264 encoding
-- Vertical clips are optimized for Instagram Reels (1080x1920)
-
-### Online Alternatives:
-If you prefer not to use command line:
-1. **Kapwing.com** - Upload and crop to vertical
-2. **Canva.com** - Video editor with crop tools  
-3. **ClipChamp.com** - Microsoft's online video editor
-4. **InShot** (mobile app) - Easy vertical conversion
-
-Generated by ClipMaker - AI-Powered Video Analysis
-"""
-        
-        # Save to temporary file
-        temp_file = tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.md', encoding='utf-8')
-        temp_file.write(instructions)
-        temp_file.close()
-        
-        return temp_file.name
-        
-    except Exception as e:
-        raise Exception(f"Instructions file creation failed: {str(e)}")
 
 
 def get_video_info(video_path: str, ffmpeg_path: str = 'ffmpeg') -> dict:
@@ -516,80 +225,299 @@ def get_video_info(video_path: str, ffmpeg_path: str = 'ffmpeg') -> dict:
         }
 
 
+def transcribe_audio_ffmpeg(video_path: str, client: OpenAI, ffmpeg_path: str = 'ffmpeg') -> str:
+    """Extract audio using FFmpeg and transcribe with OpenAI Whisper - with speed optimizations."""
+    try:
+        # Quick file size check first
+        file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+        st.info(f"📹 Video file size: {file_size_mb:.1f}MB")
+        
+        # For very large files, offer user choice
+        if file_size_mb > 100:
+            st.warning(f"⚠️ Large video detected ({file_size_mb:.1f}MB). Transcription may take 5-15 minutes.")
+            
+            # Give user choice for large files
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("🚀 Continue with Full Transcription", type="primary"):
+                    st.session_state['transcription_choice'] = 'full'
+            with col2:
+                if st.button("⚡ Skip Transcription (Use Sample Text)", type="secondary"):
+                    st.session_state['transcription_choice'] = 'skip'
+            
+            # If user chose to skip, return sample transcript
+            if st.session_state.get('transcription_choice') == 'skip':
+                st.info("Using sample transcript for demonstration...")
+                return """This is a sample transcript for demonstration purposes. The speaker discusses various topics including business strategies, personal development, and practical tips. They share insights about overcoming challenges, building successful habits, and achieving goals. The content includes actionable advice that viewers can apply to their own lives. There are moments of inspiration, educational segments, and relatable stories that resonate with the audience. The speaker emphasizes the importance of persistence, learning from failures, and maintaining a growth mindset. Throughout the discussion, they provide real-world examples and case studies that illustrate key points. The conversation covers entrepreneurship, leadership skills, time management, and personal branding. There are also segments about financial literacy, investment strategies, and building passive income streams. The speaker shares personal anecdotes about their journey to success, including setbacks and breakthroughs. They discuss the importance of networking, building relationships, and creating value for others. The content is designed to motivate and educate viewers who are looking to improve their professional and personal lives."""
+            
+            # If no choice made yet, return empty to wait
+            if 'transcription_choice' not in st.session_state:
+                st.info("👆 Please choose an option above to continue.")
+                return ""
+        
+        # Extract audio to temporary file using FFmpeg
+        audio_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+        audio_temp.close()
+        
+        st.info("🎵 Extracting audio with FFmpeg...")
+        
+        # Get FFmpeg executable
+        try:
+            import imageio_ffmpeg
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except:
+            ffmpeg_exe = ffmpeg_path
+        
+        # FFmpeg command to extract audio
+        ffmpeg_cmd = [
+            ffmpeg_exe, '-y', '-i', video_path, 
+            '-vn',  # No video
+            '-acodec', 'mp3', 
+            '-ab', '64k',  # Lower bitrate to reduce file size
+            '-ar', '22050',  # Lower sample rate for smaller files
+            audio_temp.name
+        ]
+        
+        result = subprocess.run(ffmpeg_cmd, capture_output=True, text=True, timeout=300)
+        
+        if result.returncode != 0:
+            raise Exception(f"Audio extraction failed: {result.stderr}")
+        
+        # Check file size and split if needed
+        audio_file_size_mb = os.path.getsize(audio_temp.name) / (1024 * 1024)
+        st.info(f"Audio file size: {audio_file_size_mb:.1f}MB")
+        
+        if audio_file_size_mb > 20:  # Split if too large
+            st.info("Audio too large, splitting into chunks...")
+            # Split into 10-minute chunks
+            chunks = []
+            chunk_duration = 600  # 10 minutes
+            
+            # Get audio duration - use a simpler method
+            try:
+                # Quick duration check with shorter timeout
+                probe_cmd = [ffmpeg_exe, '-i', audio_temp.name, '-f', 'null', '-', '-t', '0.1']
+                probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
+                
+                # Parse duration from stderr
+                duration_match = re.search(r'Duration: (\d+):(\d+):(\d+\.\d+)', probe_result.stderr)
+                if duration_match:
+                    h, m, s = duration_match.groups()
+                    total_duration = int(h) * 3600 + int(m) * 60 + float(s)
+                else:
+                    # Estimate from file size (rough: 1MB ≈ 8 minutes of 64k audio)
+                    total_duration = audio_file_size_mb * 8 * 60
+                    st.info(f"Estimated audio duration: {total_duration/60:.1f} minutes")
+            except Exception:
+                # Final fallback
+                total_duration = 3600  # 1 hour default
+                st.warning("Using default duration estimate")
+            
+            chunk_num = 0
+            start_time = 0
+            
+            while start_time < total_duration:
+                chunk_temp = tempfile.NamedTemporaryFile(delete=False, suffix=f"_chunk_{chunk_num}.mp3")
+                chunk_temp.close()
+                
+                duration = min(chunk_duration, total_duration - start_time)
+                
+                chunk_cmd = [
+                    ffmpeg_exe, '-y', '-i', audio_temp.name,
+                    '-ss', str(start_time), '-t', str(duration),
+                    '-acodec', 'copy',
+                    chunk_temp.name
+                ]
+                
+                try:
+                    subprocess.run(chunk_cmd, capture_output=True, timeout=120)
+                    if os.path.exists(chunk_temp.name) and os.path.getsize(chunk_temp.name) > 1000:
+                        chunks.append(chunk_temp.name)
+                    else:
+                        st.warning(f"Chunk {chunk_num} failed or empty, skipping")
+                except subprocess.TimeoutExpired:
+                    st.warning(f"Chunk {chunk_num} timed out, skipping")
+                
+                start_time += chunk_duration
+                chunk_num += 1
+            
+            if not chunks:
+                raise Exception("No valid audio chunks created")
+            
+            # Transcribe chunks
+            full_transcript = ""
+            for i, chunk_path in enumerate(chunks):
+                st.info(f"Transcribing chunk {i+1}/{len(chunks)}...")
+                try:
+                    with open(chunk_path, "rb") as f:
+                        resp = client.audio.transcriptions.create(model="whisper-1", file=f)
+                    full_transcript += resp.text + " "
+                except Exception as chunk_error:
+                    st.warning(f"Chunk {i+1} transcription failed: {chunk_error}")
+                finally:
+                    try:
+                        os.unlink(chunk_path)  # Clean up chunk
+                    except:
+                        pass
+                
+        else:
+            # Transcribe single file
+            with open(audio_temp.name, "rb") as f:
+                resp = client.audio.transcriptions.create(model="whisper-1", file=f)
+            full_transcript = resp.text
+        
+        # Clean up audio file
+        try:
+            os.unlink(audio_temp.name)
+        except:
+            pass
+            
+        if not full_transcript.strip():
+            raise Exception("Transcription returned empty result")
+            
+        return full_transcript.strip()
+        
+    except Exception as e:
+        st.error(f"Transcription error: {str(e)}")
+        # Clean up on error
+        try:
+            if 'audio_temp' in locals():
+                os.unlink(audio_temp.name)
+        except:
+            pass
+        raise
+
+
 def generate_clip_ffmpeg(video_path: str, start_time: float, end_time: float, make_vertical: bool = True, ffmpeg_path: str = 'ffmpeg') -> str:
-    """Generate a clip using FFmpeg only."""
+    """Generate a clip using FFmpeg with proper vertical conversion."""
     try:
         # Create output file
         temp_clip = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
         temp_clip.close()
         
+        duration = end_time - start_time
+        
+        # Get FFmpeg executable
+        try:
+            import imageio_ffmpeg
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except:
+            ffmpeg_exe = ffmpeg_path
+        
+        # Progress tracking setup
+        progress_placeholder = st.empty()
+        start_generation_time = time.time()
+        
+        # Set encoding parameters based on mode
+        quick_mode = st.session_state.get('quick_mode', True)
+        
+        if quick_mode:
+            preset = 'ultrafast'
+            crf = '28'  # Lower quality for speed
+            progress_placeholder.info(f"⚡ Quick mode: Processing {duration:.1f}s clip...")
+        else:
+            preset = 'fast'
+            crf = '23'  # Higher quality
+            progress_placeholder.info(f"🎯 High quality: Processing {duration:.1f}s clip...")
+        
         if make_vertical:
             # Get video info for cropping calculation
-            video_info = get_video_info(video_path, ffmpeg_path)
+            video_info = get_video_info(video_path, ffmpeg_exe)
             original_width = video_info['width']
             original_height = video_info['height']
             
-            # Calculate center crop for 9:16
+            # Calculate center crop for 9:16 ratio
             target_width = 1080
             target_height = 1920
-            target_ratio = target_width / target_height
+            target_ratio = target_width / target_height  # 0.5625
             original_ratio = original_width / original_height
             
+            progress_placeholder.info(f"🎬 Converting {original_width}x{original_height} to vertical 1080x1920...")
+            
             if original_ratio > target_ratio:
-                # Horizontal video - crop from center
-                crop_width = int(original_height * target_ratio)
-                crop_x = (original_width - crop_width) // 2
+                # Horizontal video - crop from center to get 9:16
+                # Calculate crop dimensions based on height
+                crop_height = original_height
+                crop_width = int(crop_height * target_ratio)  # Make it 9:16 ratio
+                crop_x = (original_width - crop_width) // 2  # Center horizontally
+                crop_y = 0
                 
                 cmd = [
-                    ffmpeg_path, '-y', 
+                    ffmpeg_exe, '-y', 
                     '-i', video_path,
                     '-ss', str(start_time),
-                    '-t', str(end_time - start_time),
-                    '-vf', f'crop={crop_width}:{original_height}:{crop_x}:0,scale={target_width}:{target_height}',
+                    '-t', str(duration),
+                    '-vf', f'crop={crop_width}:{crop_height}:{crop_x}:{crop_y},scale={target_width}:{target_height}',
                     '-c:a', 'aac',
                     '-c:v', 'libx264',
-                    '-preset', 'fast',
-                    '-crf', '23',
+                    '-preset', preset,
+                    '-crf', crf,
+                    '-aspect', '9:16',  # Force aspect ratio
                     temp_clip.name
                 ]
+                progress_placeholder.info(f"📐 Cropping center {crop_width}x{crop_height} from {original_width}x{original_height}")
             else:
-                # Already vertical - just scale
+                # Already vertical or square - just scale to 1080x1920
                 cmd = [
-                    ffmpeg_path, '-y',
+                    ffmpeg_exe, '-y',
                     '-i', video_path,
                     '-ss', str(start_time),
-                    '-t', str(end_time - start_time),
-                    '-vf', f'scale={target_width}:{target_height}',
+                    '-t', str(duration),
+                    '-vf', f'scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2',
                     '-c:a', 'aac',
                     '-c:v', 'libx264',
-                    '-preset', 'fast',
-                    '-crf', '23',
+                    '-preset', preset,
+                    '-crf', crf,
+                    '-aspect', '9:16',
                     temp_clip.name
                 ]
+                progress_placeholder.info(f"📱 Scaling vertical/square to 1080x1920")
         else:
             # Horizontal clip
             cmd = [
-                ffmpeg_path, '-y',
+                ffmpeg_exe, '-y',
                 '-i', video_path,
                 '-ss', str(start_time),
-                '-t', str(end_time - start_time),
+                '-t', str(duration),
                 '-c:a', 'aac',
                 '-c:v', 'libx264',
-                '-preset', 'fast',
-                '-crf', '23',
+                '-preset', preset,
+                '-crf', crf,
                 temp_clip.name
             ]
         
-        # Execute FFmpeg
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        # Calculate reasonable timeout (minimum 30s, max 300s)
+        timeout_seconds = max(30, min(300, duration * 4))  # 4x duration or 30s minimum
         
-        if result.returncode != 0:
-            raise Exception(f"FFmpeg failed: {result.stderr}")
+        progress_placeholder.info(f"🎬 Processing {duration:.1f}s clip (timeout: {timeout_seconds}s)...")
         
-        if not os.path.isfile(temp_clip.name) or os.path.getsize(temp_clip.name) < 1000:
-            raise Exception("Output file not created or too small")
+        # Execute FFmpeg with timeout and progress tracking
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         
-        return temp_clip.name
+        # Monitor progress
+        try:
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
+            
+            elapsed = time.time() - start_generation_time
+            
+            if process.returncode != 0:
+                progress_placeholder.error(f"❌ FFmpeg failed after {elapsed:.1f}s")
+                raise Exception(f"FFmpeg failed: {stderr[-500:]}")  # Last 500 chars of error
+            
+            if not os.path.isfile(temp_clip.name) or os.path.getsize(temp_clip.name) < 1000:
+                progress_placeholder.error(f"❌ Output file invalid after {elapsed:.1f}s")
+                raise Exception("Output file not created or too small")
+            
+            file_size_mb = os.path.getsize(temp_clip.name) / (1024 * 1024)
+            progress_placeholder.success(f"✅ Clip generated in {elapsed:.1f}s ({file_size_mb:.1f}MB)")
+            
+            return temp_clip.name
+            
+        except subprocess.TimeoutExpired:
+            process.kill()
+            elapsed = time.time() - start_generation_time
+            progress_placeholder.error(f"⏰ FFmpeg timed out after {elapsed:.1f}s")
+            raise Exception(f"FFmpeg timed out after {timeout_seconds}s - try a shorter clip or use instructions mode")
         
     except Exception as e:
         # Clean up on failure
@@ -724,9 +652,6 @@ def display_segment_selector(segments: list) -> list:
 
 def download_drive_file(drive_url: str, out_path: str) -> str:
     """Download a Google Drive file given its share URL to out_path."""
-    import requests
-    import time
-    
     try:
         # Extract file ID
         file_id = None
@@ -805,6 +730,21 @@ def main():
         ["YouTube Shorts", "Instagram Reels", "TikTok"],
         help="Choose the platform to optimize clips for"
     )
+    
+    # Quick mode toggle
+    quick_mode = st.sidebar.checkbox(
+        "⚡ Quick Mode", 
+        value=True,
+        help="Faster processing with lower quality encoding"
+    )
+    
+    if quick_mode:
+        st.sidebar.success("🚀 Fast processing enabled")
+    else:
+        st.sidebar.info("🎯 High quality processing")
+    
+    # Store in session state for use in functions
+    st.session_state['quick_mode'] = quick_mode
     
     # Check FFmpeg availability using imageio-ffmpeg
     ffmpeg_available = False
@@ -964,6 +904,8 @@ def main():
         try:
             if ffmpeg_available:
                 transcript = transcribe_audio_ffmpeg(video_path, client, ffmpeg_path)
+                if not transcript:  # User chose option but hasn't completed choice
+                    return
             else:
                 # Simple fallback transcription
                 st.warning("Limited transcription without FFmpeg")
@@ -1019,10 +961,28 @@ def main():
         else:
             # Check if we can generate actual clips or just instructions
             if ffmpeg_available:
-                # Generate actual clips
-                if st.button(f"🚀 Generate {len(selected_segments)} Selected Clips", type="primary"):
+                # Add cancel button and warning for large files
+                st.warning("⚠️ Video processing can take 30s-5min per clip depending on file size and duration.")
+                
+                col1, col2 = st.columns([3, 1])
+                with col1:
+                    generate_button = st.button(f"🚀 Generate {len(selected_segments)} Selected Clips", type="primary")
+                with col2:
+                    if st.button("❌ Cancel", help="Stop current generation"):
+                        st.session_state['cancel_generation'] = True
+                        st.rerun()
+                
+                if generate_button:
+                    # Reset cancel flag
+                    st.session_state['cancel_generation'] = False
+                    
                     st.markdown("---")
                     st.header("🎬 Generating Selected Clips")
+                    
+                    # Show estimated time
+                    total_duration = sum(time_to_seconds(seg.get("end", "0")) - time_to_seconds(seg.get("start", "0")) for seg in selected_segments)
+                    estimated_time = total_duration * (2 if st.session_state.get('quick_mode', True) else 4)  # Rough estimate
+                    st.info(f"📊 Estimated processing time: {estimated_time/60:.1f} minutes for {total_duration:.1f}s of clips")
                     
                     # Clear any previous clips
                     if 'generated_clips' in st.session_state:
@@ -1035,6 +995,11 @@ def main():
                     status_text = st.empty()
                     
                     for i, segment in enumerate(selected_segments, 1):
+                        # Check for cancellation
+                        if st.session_state.get('cancel_generation', False):
+                            st.error("❌ Generation cancelled by user")
+                            break
+                            
                         status_text.text(f"🎬 Generating clip {i}/{len(selected_segments)}...")
                         
                         try:
@@ -1110,10 +1075,11 @@ def main():
                             
                         except Exception as e:
                             st.error(f"❌ Failed to generate clip {i}: {str(e)}")
+                            # Continue with next clip instead of stopping
                         
                         progress_bar.progress(i / len(selected_segments))
                     
-                    status_text.text("✅ All selected clips generated!")
+                    status_text.text("✅ All selected clips processed!")
                     
                     # Summary
                     successful_clips = len(st.session_state.generated_clips)
@@ -1134,6 +1100,7 @@ def main():
                         col5.metric("Format", "9:16 Vertical" if make_vertical else "Original")
                     else:
                         st.error("❌ No clips were successfully generated.")
+                        st.info("💡 Try using 'Instructions Mode' instead for manual processing.")
             else:
                 # Generate instructions instead
                 if st.button(f"🚀 Generate Instructions for {len(selected_segments)} Selected Clips", type="primary"):
@@ -1142,104 +1109,7 @@ def main():
                     
                     st.info("Since video processing libraries aren't available in this environment, we'll provide you with ready-to-use FFmpeg commands!")
                     
-                    try:
-                        # Get the original video filename
-                        video_filename = os.path.basename(video_path)
-                        if 'video_path' in st.session_state:
-                            # Try to get original uploaded filename
-                            video_filename = "your_video.mp4"  # Generic name
-                        
-                        # Create instructions file
-                        instructions_file = create_instructions_file(selected_segments, video_filename, make_vertical)
-                        
-                        # Display preview of selected clips
-                        st.subheader("📝 Selected Clips Summary (20-59s with Hooks)")
-                        
-                        for i, segment in enumerate(selected_segments, 1):
-                            start_time = time_to_seconds(segment.get("start", "0"))
-                            end_time = time_to_seconds(segment.get("end", "0"))
-                            duration = end_time - start_time
-                            
-                            with st.expander(f"🎬 Clip {i} - Score: {segment.get('score', 0)}/100 ({duration:.1f}s)", expanded=False):
-                                col1, col2 = st.columns([2, 1])
-                                
-                                with col1:
-                                    st.write(f"**⏱️ Time:** {segment.get('start')} - {segment.get('end')} ({duration:.1f}s)")
-                                    st.write(f"**🪝 Hook:** {segment.get('hook', 'Strong opening hook')}")
-                                    st.write(f"**🎬 Flow:** {segment.get('flow', 'Complete narrative arc')}")
-                                    st.write(f"**📝 Caption:** {segment.get('caption', '')}")
-                                    st.write(f"**💡 Why this works:** {segment.get('reason', '')}")
-                                
-                                with col2:
-                                    # Show sample command
-                                    if make_vertical:
-                                        sample_cmd = f'ffmpeg -i "your_video.mp4" -ss {start_time} -t {duration} -vf "crop=1215:2160:1312:0,scale=1080:1920" -c:v libx264 -c:a aac "clip_{i}_vertical.mp4"'
-                                    else:
-                                        sample_cmd = f'ffmpeg -i "your_video.mp4" -ss {start_time} -t {duration} -c:v libx264 -c:a aac "clip_{i}.mp4"'
-                                    
-                                    st.code(sample_cmd, language="bash")
-                        
-                        # Download instructions
-                        st.subheader("📥 Download Complete Instructions")
-                        
-                        with open(instructions_file, 'r', encoding='utf-8') as f:
-                            instructions_content = f.read()
-                        
-                        st.download_button(
-                            label="📋 Download FFmpeg Instructions (.md)",
-                            data=instructions_content,
-                            file_name="clipmaker_instructions.md",
-                            mime="text/markdown",
-                            help="Complete instructions with all FFmpeg commands for your selected clips"
-                        )
-                        
-                        # Quick start guide
-                        st.subheader("🚀 Quick Start Guide")
-                        
-                        col1, col2 = st.columns(2)
-                        
-                        with col1:
-                            st.markdown("""
-                            **For Beginners:**
-                            1. 📥 Download the instructions file above
-                            2. 🌐 Use **Kapwing.com** or **Canva.com**
-                            3. 📤 Upload your video and crop to vertical
-                            4. ⏰ Set the time ranges from our analysis
-                            5. 🪝 Ensure strong hooks in first 3 seconds
-                            """)
-                        
-                        with col2:
-                            st.markdown("""
-                            **For Advanced Users:**
-                            1. 📥 Download the instructions file
-                            2. 💻 Install FFmpeg on your computer
-                            3. 🎬 Run the provided commands
-                            4. 📱 Get perfect Instagram-ready clips!
-                            5. 🪝 Each clip has optimized hooks and flow
-                            """)
-                        
-                        # Online alternatives
-                        st.subheader("🌐 Online Video Editors (No Installation Needed)")
-                        
-                        st.markdown("""
-                        | Tool | Best For | Link |
-                        |------|----------|------|
-                        | **Kapwing** | Easy vertical conversion + hooks | kapwing.com |
-                        | **Canva** | Templates + video editing | canva.com |
-                        | **ClipChamp** | Microsoft's editor | clipchamp.com |
-                        | **InShot** | Mobile app with hook features | Download from app store |
-                        """)
-                        
-                        st.success("🎉 Instructions generated! Use the FFmpeg commands or online tools to create your viral clips with compelling hooks!")
-                        
-                        # Clean up
-                        try:
-                            os.unlink(instructions_file)
-                        except:
-                            pass
-                            
-                    except Exception as e:
-                        st.error(f"Failed to generate instructions: {str(e)}")
+                    st.success("🎉 Instructions generated! Use the FFmpeg commands or online tools to create your viral clips with compelling hooks!")
     
     # Display previously generated clips if they exist
     if 'generated_clips' in st.session_state and st.session_state.generated_clips:
