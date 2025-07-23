@@ -497,17 +497,29 @@ def generate_clips(video_path: str, segments: list, make_vertical: bool = False)
                 
                 st.info(f"Writing clip {i} to file...")
                 
-                # Write video file with optimized settings
-                clip.write_videofile(
-                    temp_file.name, 
-                    codec="libx264", 
-                    audio_codec="aac",
-                    temp_audiofile_path=tempfile.gettempdir(),
-                    preset='medium',  # Good balance of speed and quality
-                    fps=30,
-                    verbose=False,
-                    logger=None  # Suppress moviepy logs
-                )
+                # Write video file with compatible settings for older MoviePy versions
+                try:
+                    clip.write_videofile(
+                        temp_file.name, 
+                        codec="libx264", 
+                        audio_codec="aac",
+                        temp_audiofile_path=tempfile.gettempdir(),
+                        preset='medium',
+                        fps=30
+                    )
+                except Exception as write_error:
+                    st.error(f"Error writing clip {i} with preset: {str(write_error)}")
+                    # Try simpler encoding without preset
+                    try:
+                        clip.write_videofile(
+                            temp_file.name, 
+                            codec="libx264", 
+                            audio_codec="aac"
+                        )
+                    except Exception as simple_error:
+                        st.error(f"Error writing clip {i} with simple settings: {str(simple_error)}")
+                        # Try most basic encoding
+                        clip.write_videofile(temp_file.name)
                 
                 # Verify file was created
                 if os.path.isfile(temp_file.name) and os.path.getsize(temp_file.name) > 0:
