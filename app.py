@@ -433,47 +433,45 @@ def generate_clip_ffmpeg(video_path: str, start_time: float, end_time: float, ma
             original_ratio = original_width / original_height
             
             if original_ratio > target_ratio:
-                # Horizontal video - crop from center and scale
-                # Simplified approach: crop to 9:16 ratio then scale
+                # Horizontal video - need to crop and scale properly
+                # Method 1: Crop from center to get 9:16 ratio, then scale up to fill
                 crop_height = original_height
                 crop_width = int(crop_height * target_ratio)
                 crop_x = (original_width - crop_width) // 2
                 crop_y = 0
                 
-                # Simplified FFmpeg command
+                # Use scale filter to fill the entire 1080x1920 frame
                 cmd = [
                     ffmpeg_exe, '-y', 
                     '-i', video_path,
                     '-ss', str(start_time),
                     '-t', str(duration),
-                    '-vf', f'crop={crop_width}:{crop_height}:{crop_x}:{crop_y},scale={target_width}:{target_height}',
-                    '-c:a', 'aac', '-b:a', '128k',
+                    '-vf', f'crop={crop_width}:{crop_height}:{crop_x}:{crop_y},scale={target_width}:{target_height}:force_original_aspect_ratio=increase,crop={target_width}:{target_height}',
+                    '-c:a', 'aac',
                     '-c:v', 'libx264',
-                    '-preset', 'veryfast',  # Even faster than ultrafast but more stable
-                    '-crf', '28',
-                    '-movflags', '+faststart',  # For better web compatibility
-                    '-avoid_negative_ts', 'make_zero',  # Fix timestamp issues
+                    '-preset', preset,
+                    '-crf', crf,
+                    '-r', '30',  # Force 30fps
                     temp_clip.name
                 ]
-                progress_placeholder.info(f"📐 Cropping center {crop_width}x{crop_height} and scaling to {target_width}x{target_height}")
+                progress_placeholder.info(f"📐 Cropping center {crop_width}x{crop_height} and scaling to fill 1080x1920")
                 
             else:
-                # Already vertical or square - just scale
+                # Already vertical or square - scale to fill 1080x1920
                 cmd = [
                     ffmpeg_exe, '-y',
                     '-i', video_path,
                     '-ss', str(start_time),
                     '-t', str(duration),
-                    '-vf', f'scale={target_width}:{target_height}',
-                    '-c:a', 'aac', '-b:a', '128k',
+                    '-vf', f'scale={target_width}:{target_height}:force_original_aspect_ratio=increase,crop={target_width}:{target_height}',
+                    '-c:a', 'aac',
                     '-c:v', 'libx264',
-                    '-preset', 'veryfast',
-                    '-crf', '28',
-                    '-movflags', '+faststart',
-                    '-avoid_negative_ts', 'make_zero',
+                    '-preset', preset,
+                    '-crf', crf,
+                    '-r', '30',
                     temp_clip.name
                 ]
-                progress_placeholder.info(f"📱 Scaling to {target_width}x{target_height} shorts format")
+                progress_placeholder.info(f"📱 Scaling to fill 1080x1920 shorts format")
         else:
             # Horizontal clip - keep original aspect ratio
             cmd = [
@@ -481,64 +479,60 @@ def generate_clip_ffmpeg(video_path: str, start_time: float, end_time: float, ma
                 '-i', video_path,
                 '-ss', str(start_time),
                 '-t', str(duration),
-                '-c:a', 'aac', '-b:a', '128k',
+                '-c:a', 'aac',
                 '-c:v', 'libx264',
-                '-preset', 'veryfast',
-                '-crf', '28',
-                '-movflags', '+faststart',
-                '-avoid_negative_ts', 'make_zero',
+                '-preset', preset,
+                '-crf', crf,
                 temp_clip.name
             ]
             progress_placeholder.info(f"📺 Creating horizontal clip...")
         
-        # Reduce timeout for better user experience
-        timeout_seconds = max(45, min(180, duration * 3))  # 3x duration, max 3 minutes
+        # Calculate reasonable timeout
+        timeout_seconds = max(60, min(300, duration * 6))  # More time for vertical processing
         
         progress_placeholder.info(f"⚙️ Processing {duration:.1f}s clip (timeout: {timeout_seconds}s)...")
         
-        # Execute FFmpeg with better error handling
+        # Execute FFmpeg with timeout and progress tracking
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        
+        # Monitor progress
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout_seconds)
+            stdout, stderr = process.communicate(timeout=timeout_seconds)
             
             elapsed = time.time() - start_generation_time
             
-            if result.returncode != 0:
+            if process.returncode != 0:
                 progress_placeholder.error(f"❌ FFmpeg failed after {elapsed:.1f}s")
                 # Show more detailed error for debugging
-                error_details = result.stderr[-800:] if result.stderr else "No error details"
-                st.error(f"FFmpeg error details: {error_details}")
-                raise Exception(f"FFmpeg failed with return code {result.returncode}")
+                st.error(f"FFmpeg command failed. Error output: {stderr[-800:]}")
+                raise Exception(f"FFmpeg failed: {stderr[-500:]}")
             
-            if not os.path.isfile(temp_clip.name):
-                raise Exception("Output file was not created")
+            if not os.path.isfile(temp_clip.name) or os.path.getsize(temp_clip.name) < 1000:
+                progress_placeholder.error(f"❌ Output file invalid after {elapsed:.1f}s")
+                raise Exception("Output file not created or too small")
             
-            file_size = os.path.getsize(temp_clip.name)
-            if file_size < 1000:  # Less than 1KB
-                raise Exception(f"Output file too small ({file_size} bytes)")
+            file_size_mb = os.path.getsize(temp_clip.name) / (1024 * 1024)
             
-            file_size_mb = file_size / (1024 * 1024)
-            
-            # Verify the output dimensions if possible
+            # Verify the output dimensions
             try:
                 verify_info = get_video_info(temp_clip.name, ffmpeg_exe)
                 actual_width = verify_info.get('width', 0)
                 actual_height = verify_info.get('height', 0)
                 
-                if make_vertical and actual_width > 0 and actual_height > 0:
-                    if actual_width == 1080 and actual_height == 1920:
-                        progress_placeholder.success(f"✅ Perfect shorts format: {actual_width}x{actual_height} in {elapsed:.1f}s ({file_size_mb:.1f}MB)")
-                    else:
-                        progress_placeholder.success(f"✅ Clip created: {actual_width}x{actual_height} in {elapsed:.1f}s ({file_size_mb:.1f}MB)")
+                if make_vertical and (actual_width != 1080 or actual_height != 1920):
+                    st.warning(f"⚠️ Output dimensions: {actual_width}x{actual_height} (expected 1080x1920)")
                 else:
-                    progress_placeholder.success(f"✅ Clip generated in {elapsed:.1f}s ({file_size_mb:.1f}MB)")
+                    progress_placeholder.success(f"✅ Perfect shorts format: {actual_width}x{actual_height} in {elapsed:.1f}s ({file_size_mb:.1f}MB)")
             except:
                 progress_placeholder.success(f"✅ Clip generated in {elapsed:.1f}s ({file_size_mb:.1f}MB)")
             
             return temp_clip.name
             
         except subprocess.TimeoutExpired:
-            progress_placeholder.error(f"⏰ FFmpeg timed out after {timeout_seconds}s")
-            raise Exception(f"Processing timed out after {timeout_seconds}s - try shorter clips or use instructions mode")
+            process.kill()
+            elapsed = time.time() - start_generation_time
+            progress_placeholder.error(f"⏰ FFmpeg timed out after {elapsed:.1f}s")
+            raise Exception(f"FFmpeg timed out after {timeout_seconds}s - try a shorter clip")
         
     except Exception as e:
         # Clean up on failure
@@ -693,22 +687,32 @@ def download_drive_file(drive_url: str, out_path: str) -> str:
         if not file_id:
             raise ValueError("Could not extract file ID from URL")
         
-        # Try gdown with simplified error handling
+        st.info(f"📥 Attempting to download file ID: {file_id}")
+        
+        # Try gdown first
         try:
             download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-            result = gdown.download(download_url, out_path, quiet=True)
+            result = gdown.download(download_url, out_path, quiet=False)
             
             if result and os.path.isfile(result) and os.path.getsize(result) > 0:
                 return result
         except Exception as gdown_error:
             error_msg = str(gdown_error).lower()
-            if "too many users" in error_msg or "rate limit" in error_msg or "quota" in error_msg:
+            if "too many users" in error_msg or "rate limit" in error_msg:
+                st.error("🚫 Google Drive rate limit reached!")
+                st.markdown("""
+                **Solutions:**
+                1. **Wait 1-24 hours** and try again
+                2. **Use direct upload** in the sidebar instead
+                3. **Manual download** then upload the file
+                """)
                 raise Exception("Google Drive rate limit - please use direct upload")
         
-        raise Exception("Download failed - please use direct upload instead")
+        raise Exception("Download failed - please use direct file upload instead")
         
     except Exception as e:
-        raise Exception(str(e))
+        st.error(f"Download error: {str(e)}")
+        raise
 
 
 # ----------
@@ -720,26 +724,6 @@ def main():
     
     st.title("🎬 Long‑form to Short‑form ClipMaker")
     st.markdown("Transform your long-form content into viral short-form clips (20-59s) with compelling hooks!")
-
-    # Add helpful notice about Google Drive issues
-    if st.session_state.get('show_drive_warning', True):
-        with st.container():
-            col1, col2 = st.columns([4, 1])
-            with col1:
-                st.info("💡 **Tip:** Use direct file upload in the sidebar for best reliability. Google Drive often hits rate limits.")
-            with col2:
-                if st.button("✕", help="Dismiss", key="dismiss_warning"):
-                    st.session_state['show_drive_warning'] = False
-                    st.rerun()
-
-    # Initialize session state for better state management
-    if 'app_initialized' not in st.session_state:
-        st.session_state.app_initialized = True
-        st.session_state.current_step = 'upload'  # upload, analyzing, results, generating
-    
-    # Preserve state across downloads
-    if 'preserve_state' not in st.session_state:
-        st.session_state.preserve_state = True
 
     # Load & validate API Key
     API_KEY = get_api_key()
@@ -790,18 +774,22 @@ def main():
         result = subprocess.run([ffmpeg_path, '-version'], capture_output=True, timeout=5)
         if result.returncode == 0:
             ffmpeg_available = True
+            st.sidebar.success("✅ FFmpeg available (imageio-ffmpeg)")
         else:
             raise Exception("FFmpeg test failed")
             
     except Exception as e:
+        st.sidebar.warning("⚠️ imageio-ffmpeg not available, trying system FFmpeg")
+        
         # Fallback to system FFmpeg
         try:
             result = subprocess.run(['ffmpeg', '-version'], capture_output=True, timeout=5)
             if result.returncode == 0:
                 ffmpeg_available = True
                 ffmpeg_path = 'ffmpeg'
+                st.sidebar.success("✅ System FFmpeg available")
         except:
-            pass
+            st.sidebar.error("❌ No FFmpeg found")
             
     if not ffmpeg_available:
         st.sidebar.markdown("""
@@ -826,16 +814,21 @@ def main():
             value=True,
             help="Convert to vertical format perfect for Instagram Reels"
         )
+        
+        if make_vertical:
+            st.sidebar.success("📱 Perfect 1080x1920 Instagram format")
+        else:
+            st.sidebar.info("📺 Original horizontal format")
 
     # Video source
     st.sidebar.subheader("📹 Video Source")
+    st.sidebar.info("💡 **Direct upload recommended** to avoid rate limits!")
     
-    # Make direct upload more prominent
-    st.sidebar.markdown("**🚀 Recommended: Direct Upload**")
+    # Direct upload (primary option)
     uploaded = st.sidebar.file_uploader(
         "📁 Upload video file", 
         type=["mp4", "mov", "mkv", "avi", "webm"],
-        help="Most reliable method - no rate limits"
+        help="Direct upload is most reliable"
     )
     
     video_path = None
@@ -855,38 +848,34 @@ def main():
         else:
             st.info("Large file uploaded. Skipping preview to save memory.")
     
-    # Only show Google Drive if no file uploaded
-    if not uploaded:
-        st.sidebar.markdown("---")
-        st.sidebar.markdown("**⚠️ Alternative: Google Drive (Limited)**")
-        st.sidebar.caption("⚠️ May hit rate limits - direct upload recommended")
-        
-        drive_url = st.sidebar.text_input(
-            "Google Drive URL", 
-            placeholder="https://drive.google.com/file/d/...",
-            help="Often hits rate limits - use at your own risk"
-        )
-        
-        if drive_url:
-            if st.sidebar.button("📥 Try Download from Drive"):
-                with st.spinner("Attempting Google Drive download..."):
-                    try:
-                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                        result = download_drive_file(drive_url, tmp.name)
+    # Google Drive option (secondary)
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 🔗 Google Drive (Alternative)")
+    drive_url = st.sidebar.text_input(
+        "Google Drive URL", 
+        placeholder="https://drive.google.com/file/d/...",
+        help="May hit rate limits - direct upload recommended"
+    )
+    
+    if drive_url and not uploaded:
+        if st.sidebar.button("📥 Download from Drive"):
+            with st.spinner("Downloading from Google Drive…"):
+                try:
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                    result = download_drive_file(drive_url, tmp.name)
+                    
+                    if result and os.path.isfile(result):
+                        size_mb = os.path.getsize(result) / (1024 * 1024)
+                        st.success(f"✅ Downloaded {size_mb:.2f} MB from Drive")
+                        video_path = result
+                        st.session_state['video_path'] = video_path
+                        st.session_state['video_size'] = size_mb
                         
-                        if result and os.path.isfile(result):
-                            size_mb = os.path.getsize(result) / (1024 * 1024)
-                            st.success(f"✅ Downloaded {size_mb:.2f} MB from Drive")
-                            video_path = result
-                            st.session_state['video_path'] = video_path
-                            st.session_state['video_size'] = size_mb
-                            
-                            if size_mb <= 500:
-                                st.video(video_path)
-                    except Exception as e:
-                        st.error("❌ Google Drive download failed (rate limited)")
-                        st.info("💡 **Solution:** Use the direct upload option above instead")
-                        return
+                        if size_mb <= 500:
+                            st.video(video_path)
+                except Exception as e:
+                    st.error(f"Drive download failed: {str(e)}")
+                    return
 
     # Use video from session state if available
     if not video_path and 'video_path' in st.session_state:
@@ -907,10 +896,6 @@ def main():
         if not video_path or not os.path.isfile(video_path):
             st.error("Video file not found. Please reload your video.")
             return
-        
-        # Clear any old transcription state
-        if 'transcription_choice' in st.session_state:
-            del st.session_state['transcription_choice']
             
         # Progress tracking
         progress_bar = st.progress(0)
@@ -934,6 +919,8 @@ def main():
         try:
             if ffmpeg_available:
                 transcript = transcribe_audio_ffmpeg(video_path, client, ffmpeg_path)
+                if not transcript:  # User chose option but hasn't completed choice
+                    return
             else:
                 # Simple fallback transcription
                 st.warning("Limited transcription without FFmpeg")
@@ -972,7 +959,6 @@ def main():
         # Store segments in session state
         st.session_state['ai_segments'] = segments
         st.session_state['video_analyzed'] = True
-        st.session_state['current_step'] = 'results'
         progress_bar.progress(100)
         status_text.text("✅ Analysis complete! Select clips below.")
         
@@ -1002,9 +988,8 @@ def main():
                         st.rerun()
                 
                 if generate_button:
-                    # Reset cancel flag and set generating state
+                    # Reset cancel flag
                     st.session_state['cancel_generation'] = False
-                    st.session_state['current_step'] = 'generating'
                     
                     st.markdown("---")
                     st.header("🎬 Generating Selected Clips")
@@ -1103,8 +1088,6 @@ def main():
                                 st.markdown("---")
                                 with open(clip_info["path"], "rb") as file:
                                     file_extension = "vertical" if make_vertical else "horizontal"
-                                    # Use a unique key that includes timestamp to prevent rerun
-                                    download_key = f"download_{clip_info['index']}_{int(time.time())}"
                                     st.download_button(
                                         label="⬇️ Download Clip",
                                         data=file,
@@ -1112,8 +1095,7 @@ def main():
                                         mime="video/mp4",
                                         use_container_width=True,
                                         type="primary",
-                                        key=download_key,
-                                        on_click=None  # Prevent callback that might cause rerun
+                                        key=f"download_{clip_info['index']}"
                                     )
                             
                             st.markdown("---")
@@ -1126,7 +1108,6 @@ def main():
                         progress_bar.progress(i / len(selected_segments))
                     
                     status_text.text("✅ All selected clips processed!")
-                    st.session_state['current_step'] = 'completed'
                     
                     # Summary
                     successful_clips = len(st.session_state.generated_clips)
@@ -1166,13 +1147,17 @@ def main():
         for clip_info in st.session_state.generated_clips:
             # Create expandable section for each clip
             with st.expander(f"🎬 Clip {clip_info['index']} - Score: {clip_info['score']}/100", expanded=False):
-                video_col, details_col = st.columns([1, 1.5])
+                video_col, details_col = st.columns([1.2, 1])
                 
                 with video_col:
                     if os.path.isfile(clip_info["path"]):
-                        st.video(clip_info["path"], start_time=0)
+                        st.video(clip_info["path"])
                     else:
                         st.error("❌ Clip file no longer available")
+                        
+                    # Caption below video
+                    with st.expander("📝 Suggested Caption", expanded=False):
+                        st.code(clip_info["caption"], language="text")
                 
                 with details_col:
                     # Clip details
@@ -1185,10 +1170,6 @@ def main():
                     💾 **Size:** {clip_info['file_size']}
                     """
                     st.markdown(detail_info)
-                    
-                    # Caption section
-                    with st.expander("📝 Suggested Caption", expanded=False):
-                        st.code(clip_info["caption"], language="text")
                     
                     # Analysis sections
                     with st.expander("🪝 Hook Analysis", expanded=False):
@@ -1205,8 +1186,6 @@ def main():
                     if os.path.isfile(clip_info["path"]):
                         with open(clip_info["path"], "rb") as file:
                             file_extension = "vertical" if make_vertical else "horizontal"
-                            # Use unique key to prevent state issues
-                            persistent_key = f"persistent_download_{clip_info['index']}_{hash(clip_info['path'])}"
                             st.download_button(
                                 label="⬇️ Download Clip",
                                 data=file,
@@ -1214,20 +1193,19 @@ def main():
                                 mime="video/mp4",
                                 use_container_width=True,
                                 type="primary",
-                                key=persistent_key,
-                                on_click=None
+                                key=f"persistent_download_{clip_info['index']}"
                             )
                     else:
                         st.error("❌ File no longer available")
+            
+            st.markdown("---")
 
-    # Reset button with confirmation
-    st.sidebar.markdown("---")
-    if st.sidebar.button("🔄 Start Over", help="Clear all data and start fresh"):
-        # Clear all session state including any old transcription choices
+    # Reset button
+    if st.sidebar.button("🔄 Start Over"):
+        # Clear all session state
         for key in list(st.session_state.keys()):
-            if key not in ['app_initialized', 'show_drive_warning']:  # Keep only essential app state
+            if key.startswith(('ai_segments', 'video_analyzed', 'generated_clips', 'selected_clips')):
                 del st.session_state[key]
-        st.session_state['current_step'] = 'upload'
         st.rerun()
 
 
