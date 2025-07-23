@@ -687,32 +687,22 @@ def download_drive_file(drive_url: str, out_path: str) -> str:
         if not file_id:
             raise ValueError("Could not extract file ID from URL")
         
-        st.info(f"📥 Attempting to download file ID: {file_id}")
-        
-        # Try gdown first
+        # Try gdown with simplified error handling
         try:
             download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
-            result = gdown.download(download_url, out_path, quiet=False)
+            result = gdown.download(download_url, out_path, quiet=True)
             
             if result and os.path.isfile(result) and os.path.getsize(result) > 0:
                 return result
         except Exception as gdown_error:
             error_msg = str(gdown_error).lower()
-            if "too many users" in error_msg or "rate limit" in error_msg:
-                st.error("🚫 Google Drive rate limit reached!")
-                st.markdown("""
-                **Solutions:**
-                1. **Wait 1-24 hours** and try again
-                2. **Use direct upload** in the sidebar instead
-                3. **Manual download** then upload the file
-                """)
+            if "too many users" in error_msg or "rate limit" in error_msg or "quota" in error_msg:
                 raise Exception("Google Drive rate limit - please use direct upload")
         
-        raise Exception("Download failed - please use direct file upload instead")
+        raise Exception("Download failed - please use direct upload instead")
         
     except Exception as e:
-        st.error(f"Download error: {str(e)}")
-        raise
+        raise Exception(str(e))
 
 
 # ----------
@@ -724,6 +714,17 @@ def main():
     
     st.title("🎬 Long‑form to Short‑form ClipMaker")
     st.markdown("Transform your long-form content into viral short-form clips (20-59s) with compelling hooks!")
+
+    # Add helpful notice about Google Drive issues
+    if st.session_state.get('show_drive_warning', True):
+        with st.container():
+            col1, col2 = st.columns([4, 1])
+            with col1:
+                st.info("💡 **Tip:** Use direct file upload in the sidebar for best reliability. Google Drive often hits rate limits.")
+            with col2:
+                if st.button("✕", help="Dismiss", key="dismiss_warning"):
+                    st.session_state['show_drive_warning'] = False
+                    st.rerun()
 
     # Initialize session state for better state management
     if 'app_initialized' not in st.session_state:
@@ -823,11 +824,12 @@ def main():
     # Video source
     st.sidebar.subheader("📹 Video Source")
     
-    # Direct upload (primary option)
+    # Make direct upload more prominent
+    st.sidebar.markdown("**🚀 Recommended: Direct Upload**")
     uploaded = st.sidebar.file_uploader(
         "📁 Upload video file", 
         type=["mp4", "mov", "mkv", "avi", "webm"],
-        help="Recommended: Upload directly for best reliability"
+        help="Most reliable method - no rate limits"
     )
     
     video_path = None
@@ -847,34 +849,38 @@ def main():
         else:
             st.info("Large file uploaded. Skipping preview to save memory.")
     
-    # Google Drive option (secondary)
-    st.sidebar.markdown("---")
-    st.sidebar.markdown("### 🔗 Google Drive (Alternative)")
-    drive_url = st.sidebar.text_input(
-        "Google Drive URL", 
-        placeholder="https://drive.google.com/file/d/...",
-        help="May hit rate limits - direct upload recommended"
-    )
-    
-    if drive_url and not uploaded:
-        if st.sidebar.button("📥 Download from Drive"):
-            with st.spinner("Downloading from Google Drive…"):
-                try:
-                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-                    result = download_drive_file(drive_url, tmp.name)
-                    
-                    if result and os.path.isfile(result):
-                        size_mb = os.path.getsize(result) / (1024 * 1024)
-                        st.success(f"✅ Downloaded {size_mb:.2f} MB from Drive")
-                        video_path = result
-                        st.session_state['video_path'] = video_path
-                        st.session_state['video_size'] = size_mb
+    # Only show Google Drive if no file uploaded
+    if not uploaded:
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("**⚠️ Alternative: Google Drive (Limited)**")
+        st.sidebar.caption("⚠️ May hit rate limits - direct upload recommended")
+        
+        drive_url = st.sidebar.text_input(
+            "Google Drive URL", 
+            placeholder="https://drive.google.com/file/d/...",
+            help="Often hits rate limits - use at your own risk"
+        )
+        
+        if drive_url:
+            if st.sidebar.button("📥 Try Download from Drive"):
+                with st.spinner("Attempting Google Drive download..."):
+                    try:
+                        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
+                        result = download_drive_file(drive_url, tmp.name)
                         
-                        if size_mb <= 500:
-                            st.video(video_path)
-                except Exception as e:
-                    st.error(f"Drive download failed: {str(e)}")
-                    return
+                        if result and os.path.isfile(result):
+                            size_mb = os.path.getsize(result) / (1024 * 1024)
+                            st.success(f"✅ Downloaded {size_mb:.2f} MB from Drive")
+                            video_path = result
+                            st.session_state['video_path'] = video_path
+                            st.session_state['video_size'] = size_mb
+                            
+                            if size_mb <= 500:
+                                st.video(video_path)
+                    except Exception as e:
+                        st.error("❌ Google Drive download failed (rate limited)")
+                        st.info("💡 **Solution:** Use the direct upload option above instead")
+                        return
 
     # Use video from session state if available
     if not video_path and 'video_path' in st.session_state:
@@ -895,6 +901,10 @@ def main():
         if not video_path or not os.path.isfile(video_path):
             st.error("Video file not found. Please reload your video.")
             return
+        
+        # Clear any old transcription state
+        if 'transcription_choice' in st.session_state:
+            del st.session_state['transcription_choice']
             
         # Progress tracking
         progress_bar = st.progress(0)
@@ -918,8 +928,6 @@ def main():
         try:
             if ffmpeg_available:
                 transcript = transcribe_audio_ffmpeg(video_path, client, ffmpeg_path)
-                if not transcript:  # User chose option but hasn't completed choice
-                    return
             else:
                 # Simple fallback transcription
                 st.warning("Limited transcription without FFmpeg")
@@ -1209,9 +1217,9 @@ def main():
     # Reset button with confirmation
     st.sidebar.markdown("---")
     if st.sidebar.button("🔄 Start Over", help="Clear all data and start fresh"):
-        # Clear all session state
+        # Clear all session state including any old transcription choices
         for key in list(st.session_state.keys()):
-            if key not in ['app_initialized']:  # Keep app initialization
+            if key not in ['app_initialized', 'show_drive_warning']:  # Keep only essential app state
                 del st.session_state[key]
         st.session_state['current_step'] = 'upload'
         st.rerun()
