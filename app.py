@@ -389,7 +389,7 @@ def transcribe_audio_ffmpeg(video_path: str, client: OpenAI, ffmpeg_path: str = 
 
 
 def generate_clip_ffmpeg(video_path: str, start_time: float, end_time: float, make_vertical: bool = True, ffmpeg_path: str = 'ffmpeg') -> str:
-    """Generate a clip using FFmpeg with proper vertical conversion."""
+    """Generate a clip using FFmpeg with proper vertical conversion like Opus does."""
     try:
         # Create output file
         temp_clip = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
@@ -414,11 +414,9 @@ def generate_clip_ffmpeg(video_path: str, start_time: float, end_time: float, ma
         if quick_mode:
             preset = 'ultrafast'
             crf = '28'  # Lower quality for speed
-            progress_placeholder.info(f"⚡ Quick mode: Processing {duration:.1f}s clip...")
         else:
             preset = 'fast'
             crf = '23'  # Higher quality
-            progress_placeholder.info(f"🎯 High quality: Processing {duration:.1f}s clip...")
         
         if make_vertical:
             # Get video info for cropping calculation
@@ -426,54 +424,56 @@ def generate_clip_ffmpeg(video_path: str, start_time: float, end_time: float, ma
             original_width = video_info['width']
             original_height = video_info['height']
             
-            # Calculate center crop for 9:16 ratio
+            progress_placeholder.info(f"🎬 Converting {original_width}x{original_height} to shorts format...")
+            
+            # Target dimensions for shorts
             target_width = 1080
             target_height = 1920
             target_ratio = target_width / target_height  # 0.5625
             original_ratio = original_width / original_height
             
-            progress_placeholder.info(f"🎬 Converting {original_width}x{original_height} to vertical 1080x1920...")
-            
             if original_ratio > target_ratio:
-                # Horizontal video - crop from center to get 9:16
-                # Calculate crop dimensions based on height
+                # Horizontal video - need to crop and scale properly
+                # Method 1: Crop from center to get 9:16 ratio, then scale up to fill
                 crop_height = original_height
-                crop_width = int(crop_height * target_ratio)  # Make it 9:16 ratio
-                crop_x = (original_width - crop_width) // 2  # Center horizontally
+                crop_width = int(crop_height * target_ratio)
+                crop_x = (original_width - crop_width) // 2
                 crop_y = 0
                 
+                # Use scale filter to fill the entire 1080x1920 frame
                 cmd = [
                     ffmpeg_exe, '-y', 
                     '-i', video_path,
                     '-ss', str(start_time),
                     '-t', str(duration),
-                    '-vf', f'crop={crop_width}:{crop_height}:{crop_x}:{crop_y},scale={target_width}:{target_height}',
+                    '-vf', f'crop={crop_width}:{crop_height}:{crop_x}:{crop_y},scale={target_width}:{target_height}:force_original_aspect_ratio=increase,crop={target_width}:{target_height}',
                     '-c:a', 'aac',
                     '-c:v', 'libx264',
                     '-preset', preset,
                     '-crf', crf,
-                    '-aspect', '9:16',  # Force aspect ratio
+                    '-r', '30',  # Force 30fps
                     temp_clip.name
                 ]
-                progress_placeholder.info(f"📐 Cropping center {crop_width}x{crop_height} from {original_width}x{original_height}")
+                progress_placeholder.info(f"📐 Cropping center {crop_width}x{crop_height} and scaling to fill 1080x1920")
+                
             else:
-                # Already vertical or square - just scale to 1080x1920
+                # Already vertical or square - scale to fill 1080x1920
                 cmd = [
                     ffmpeg_exe, '-y',
                     '-i', video_path,
                     '-ss', str(start_time),
                     '-t', str(duration),
-                    '-vf', f'scale={target_width}:{target_height}:force_original_aspect_ratio=decrease,pad={target_width}:{target_height}:(ow-iw)/2:(oh-ih)/2',
+                    '-vf', f'scale={target_width}:{target_height}:force_original_aspect_ratio=increase,crop={target_width}:{target_height}',
                     '-c:a', 'aac',
                     '-c:v', 'libx264',
                     '-preset', preset,
                     '-crf', crf,
-                    '-aspect', '9:16',
+                    '-r', '30',
                     temp_clip.name
                 ]
-                progress_placeholder.info(f"📱 Scaling vertical/square to 1080x1920")
+                progress_placeholder.info(f"📱 Scaling to fill 1080x1920 shorts format")
         else:
-            # Horizontal clip
+            # Horizontal clip - keep original aspect ratio
             cmd = [
                 ffmpeg_exe, '-y',
                 '-i', video_path,
@@ -485,11 +485,12 @@ def generate_clip_ffmpeg(video_path: str, start_time: float, end_time: float, ma
                 '-crf', crf,
                 temp_clip.name
             ]
+            progress_placeholder.info(f"📺 Creating horizontal clip...")
         
-        # Calculate reasonable timeout (minimum 30s, max 300s)
-        timeout_seconds = max(30, min(300, duration * 4))  # 4x duration or 30s minimum
+        # Calculate reasonable timeout
+        timeout_seconds = max(60, min(300, duration * 6))  # More time for vertical processing
         
-        progress_placeholder.info(f"🎬 Processing {duration:.1f}s clip (timeout: {timeout_seconds}s)...")
+        progress_placeholder.info(f"⚙️ Processing {duration:.1f}s clip (timeout: {timeout_seconds}s)...")
         
         # Execute FFmpeg with timeout and progress tracking
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
@@ -502,14 +503,28 @@ def generate_clip_ffmpeg(video_path: str, start_time: float, end_time: float, ma
             
             if process.returncode != 0:
                 progress_placeholder.error(f"❌ FFmpeg failed after {elapsed:.1f}s")
-                raise Exception(f"FFmpeg failed: {stderr[-500:]}")  # Last 500 chars of error
+                # Show more detailed error for debugging
+                st.error(f"FFmpeg command failed. Error output: {stderr[-800:]}")
+                raise Exception(f"FFmpeg failed: {stderr[-500:]}")
             
             if not os.path.isfile(temp_clip.name) or os.path.getsize(temp_clip.name) < 1000:
                 progress_placeholder.error(f"❌ Output file invalid after {elapsed:.1f}s")
                 raise Exception("Output file not created or too small")
             
             file_size_mb = os.path.getsize(temp_clip.name) / (1024 * 1024)
-            progress_placeholder.success(f"✅ Clip generated in {elapsed:.1f}s ({file_size_mb:.1f}MB)")
+            
+            # Verify the output dimensions
+            try:
+                verify_info = get_video_info(temp_clip.name, ffmpeg_exe)
+                actual_width = verify_info.get('width', 0)
+                actual_height = verify_info.get('height', 0)
+                
+                if make_vertical and (actual_width != 1080 or actual_height != 1920):
+                    st.warning(f"⚠️ Output dimensions: {actual_width}x{actual_height} (expected 1080x1920)")
+                else:
+                    progress_placeholder.success(f"✅ Perfect shorts format: {actual_width}x{actual_height} in {elapsed:.1f}s ({file_size_mb:.1f}MB)")
+            except:
+                progress_placeholder.success(f"✅ Clip generated in {elapsed:.1f}s ({file_size_mb:.1f}MB)")
             
             return temp_clip.name
             
@@ -517,7 +532,7 @@ def generate_clip_ffmpeg(video_path: str, start_time: float, end_time: float, ma
             process.kill()
             elapsed = time.time() - start_generation_time
             progress_placeholder.error(f"⏰ FFmpeg timed out after {elapsed:.1f}s")
-            raise Exception(f"FFmpeg timed out after {timeout_seconds}s - try a shorter clip or use instructions mode")
+            raise Exception(f"FFmpeg timed out after {timeout_seconds}s - try a shorter clip")
         
     except Exception as e:
         # Clean up on failure
@@ -1032,33 +1047,45 @@ def main():
                             st.session_state.generated_clips.append(clip_info)
                             
                             # Display the clip immediately
-                            st.markdown(f"### 🎬 Clip {segment.get('display_index', i)} (Score: {clip_info['score']}/100)")
+                            st.markdown(f"### 🎬 Clip {segment.get('display_index', i)} - Score: {clip_info['score']}/100")
                             
-                            col1, col2 = st.columns([2, 1])
+                            # Create two columns with better proportions
+                            video_col, details_col = st.columns([1.2, 1])
                             
-                            with col1:
+                            with video_col:
+                                # Display video with proper aspect ratio
                                 st.video(clip_info["path"])
-                                st.markdown("**📝 Suggested Caption:**")
-                                st.code(clip_info["caption"], language="text")
+                                
+                                # Caption below video
+                                with st.expander("📝 Suggested Caption", expanded=False):
+                                    st.code(clip_info["caption"], language="text")
                             
-                            with col2:
-                                st.markdown("**📊 Details:**")
-                                st.write(f"⏱️ **Duration:** {clip_info['duration']}")
-                                st.write(f"🕐 **Time:** {clip_info['start']} - {clip_info['end']}")
-                                st.write(f"🎯 **Score:** {clip_info['score']}/100")
-                                st.write(f"📱 **Format:** {clip_info['format']}")
-                                st.write(f"💾 **Size:** {clip_info['file_size']}")
+                            with details_col:
+                                # Clip details in organized sections
+                                st.markdown("**📊 Clip Details**")
+                                detail_info = f"""
+                                ⏱️ **Duration:** {clip_info['duration']}  
+                                🕐 **Time:** {clip_info['start']} - {clip_info['end']}  
+                                🎯 **Score:** {clip_info['score']}/100  
+                                📱 **Format:** {clip_info['format']}  
+                                💾 **Size:** {clip_info['file_size']}
+                                """
+                                st.markdown(detail_info)
                                 
-                                st.markdown("**🪝 Hook:**")
-                                st.write(clip_info['hook'])
+                                # Hook section
+                                with st.expander("🪝 Hook Analysis", expanded=True):
+                                    st.write(clip_info['hook'])
                                 
-                                st.markdown("**🎬 Flow:**")
-                                st.write(clip_info['flow'])
+                                # Flow section
+                                with st.expander("🎬 Content Flow", expanded=False):
+                                    st.write(clip_info['flow'])
                                 
-                                st.markdown("**💡 Why this will work:**")
-                                st.write(clip_info['reason'])
+                                # Why it works section
+                                with st.expander("💡 Viral Potential", expanded=False):
+                                    st.write(clip_info['reason'])
                                 
-                                # Download button
+                                # Download button - make it prominent
+                                st.markdown("---")
                                 with open(clip_info["path"], "rb") as file:
                                     file_extension = "vertical" if make_vertical else "horizontal"
                                     st.download_button(
@@ -1067,6 +1094,7 @@ def main():
                                         file_name=f"clip_{clip_info['index']}_{platform.replace(' ', '_').lower()}_{file_extension}.mp4",
                                         mime="video/mp4",
                                         use_container_width=True,
+                                        type="primary",
                                         key=f"download_{clip_info['index']}"
                                     )
                             
@@ -1117,48 +1145,58 @@ def main():
         st.header("📁 Previously Generated Clips")
         
         for clip_info in st.session_state.generated_clips:
-            col1, col2 = st.columns([2, 1])
-            
-            with col1:
-                st.markdown(f"### 🎬 Clip {clip_info['index']} (Score: {clip_info['score']}/100)")
-                if os.path.isfile(clip_info["path"]):
-                    st.video(clip_info["path"])
-                else:
-                    st.error("Clip file no longer available")
-                st.markdown("**📝 Suggested Caption:**")
-                st.code(clip_info["caption"], language="text")
-            
-            with col2:
-                st.markdown("**📊 Details:**")
-                st.write(f"⏱️ **Duration:** {clip_info['duration']}")
-                st.write(f"🕐 **Time:** {clip_info['start']} - {clip_info['end']}")
-                st.write(f"🎯 **Score:** {clip_info['score']}/100")
-                st.write(f"📱 **Format:** {clip_info['format']}")
-                st.write(f"💾 **Size:** {clip_info['file_size']}")
+            # Create expandable section for each clip
+            with st.expander(f"🎬 Clip {clip_info['index']} - Score: {clip_info['score']}/100", expanded=False):
+                video_col, details_col = st.columns([1.2, 1])
                 
-                st.markdown("**🪝 Hook:**")
-                st.write(clip_info.get('hook', 'Strong opening hook'))
+                with video_col:
+                    if os.path.isfile(clip_info["path"]):
+                        st.video(clip_info["path"])
+                    else:
+                        st.error("❌ Clip file no longer available")
+                        
+                    # Caption below video
+                    with st.expander("📝 Suggested Caption", expanded=False):
+                        st.code(clip_info["caption"], language="text")
                 
-                st.markdown("**🎬 Flow:**")
-                st.write(clip_info.get('flow', 'Complete narrative arc'))
-                
-                st.markdown("**💡 Why this will work:**")
-                st.write(clip_info['reason'])
-                
-                # Download button if file still exists
-                if os.path.isfile(clip_info["path"]):
-                    with open(clip_info["path"], "rb") as file:
-                        file_extension = "vertical" if make_vertical else "horizontal"
-                        st.download_button(
-                            label="⬇️ Download Clip",
-                            data=file,
-                            file_name=f"clip_{clip_info['index']}_{platform.replace(' ', '_').lower()}_{file_extension}.mp4",
-                            mime="video/mp4",
-                            use_container_width=True,
-                            key=f"persistent_download_{clip_info['index']}"
-                        )
-                else:
-                    st.error("File no longer available")
+                with details_col:
+                    # Clip details
+                    st.markdown("**📊 Clip Details**")
+                    detail_info = f"""
+                    ⏱️ **Duration:** {clip_info['duration']}  
+                    🕐 **Time:** {clip_info['start']} - {clip_info['end']}  
+                    🎯 **Score:** {clip_info['score']}/100  
+                    📱 **Format:** {clip_info['format']}  
+                    💾 **Size:** {clip_info['file_size']}
+                    """
+                    st.markdown(detail_info)
+                    
+                    # Analysis sections
+                    with st.expander("🪝 Hook Analysis", expanded=False):
+                        st.write(clip_info.get('hook', 'Strong opening hook'))
+                    
+                    with st.expander("🎬 Content Flow", expanded=False):
+                        st.write(clip_info.get('flow', 'Complete narrative arc'))
+                    
+                    with st.expander("💡 Viral Potential", expanded=False):
+                        st.write(clip_info['reason'])
+                    
+                    # Download button if file still exists
+                    st.markdown("---")
+                    if os.path.isfile(clip_info["path"]):
+                        with open(clip_info["path"], "rb") as file:
+                            file_extension = "vertical" if make_vertical else "horizontal"
+                            st.download_button(
+                                label="⬇️ Download Clip",
+                                data=file,
+                                file_name=f"clip_{clip_info['index']}_{platform.replace(' ', '_').lower()}_{file_extension}.mp4",
+                                mime="video/mp4",
+                                use_container_width=True,
+                                type="primary",
+                                key=f"persistent_download_{clip_info['index']}"
+                            )
+                    else:
+                        st.error("❌ File no longer available")
             
             st.markdown("---")
 
