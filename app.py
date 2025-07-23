@@ -414,6 +414,9 @@ def generate_clips(video_path: str, segments: list, make_vertical: bool = False)
         
         st.info(f"Video: {original_width}x{original_height}, {total_duration:.1f}s")
         
+        # Debug: Check available methods
+        st.info(f"Available VideoFileClip methods: {[method for method in dir(video) if 'clip' in method.lower()]}")
+        
         for i, seg in enumerate(segments, start=1):
             try:
                 start_time = time_to_seconds(seg.get("start", "0"))
@@ -444,8 +447,30 @@ def generate_clips(video_path: str, segments: list, make_vertical: bool = False)
                     st.warning(f"Skipping segment {i}: Clip too short ({end_time - start_time:.1f}s)")
                     continue
                 
-                # Create clip
-                clip = video.subclip(start_time, end_time)
+                # Create clip using the correct method based on the working file
+                try:
+                    # Method 1: Try the most common method first
+                    if hasattr(video, 'subclip'):
+                        st.info(f"Using subclip method for clip {i}")
+                        clip = video.subclip(start_time, end_time)
+                    elif hasattr(video, 'subclipped'):
+                        st.info(f"Using subclipped method for clip {i}")
+                        clip = video.subclipped(start_time, end_time)
+                    else:
+                        st.info(f"Using cutout method for clip {i}")
+                        # Fallback method from working file
+                        clip = video.cutout(0, start_time).cutout(end_time - start_time, video.duration)
+                        
+                except AttributeError as attr_error:
+                    st.error(f"MoviePy method error for clip {i}: {str(attr_error)}")
+                    # Try alternative approach from working file
+                    try:
+                        st.info(f"Trying fx.subclip for clip {i}")
+                        from moviepy.video.fx import subclip
+                        clip = subclip(video, start_time, end_time)
+                    except (ImportError, AttributeError) as fx_error:
+                        st.error(f"Could not create clip {i} with any method: {fx_error}")
+                        continue  # Skip this clip
                 
                 # Apply vertical conversion if requested
                 if make_vertical:
