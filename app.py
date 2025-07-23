@@ -114,12 +114,20 @@ def transcribe_audio_ffmpeg(video_path: str, client: OpenAI, ffmpeg_path: str = 
         
         st.info("🎵 Extracting audio with FFmpeg...")
         
+        # Get FFmpeg executable
+        try:
+            import imageio_ffmpeg
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except:
+            ffmpeg_exe = ffmpeg_path
+        
         # FFmpeg command to extract audio
         ffmpeg_cmd = [
-            ffmpeg_path, '-y', '-i', video_path, 
+            ffmpeg_exe, '-y', '-i', video_path, 
             '-vn',  # No video
             '-acodec', 'mp3', 
             '-ab', '64k',  # Lower bitrate to reduce file size
+            '-ar', '22050',  # Lower sample rate for smaller files
             audio_temp.name
         ]
         
@@ -138,22 +146,11 @@ def transcribe_audio_ffmpeg(video_path: str, client: OpenAI, ffmpeg_path: str = 
             chunks = []
             chunk_duration = 600  # 10 minutes
             
-            # Get audio duration using ffprobe or ffmpeg
+            # Get audio duration - use a simpler method
             try:
-                # Try imageio-ffmpeg's ffprobe first
-                import imageio_ffmpeg
-                ffprobe_path = imageio_ffmpeg.get_ffprobe_exe()
-                probe_cmd = [ffprobe_path, '-v', 'quiet', '-print_format', 'json', '-show_format', audio_temp.name]
-                probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
-                if probe_result.returncode == 0:
-                    info = json.loads(probe_result.stdout)
-                    total_duration = float(info['format']['duration'])
-                else:
-                    raise Exception("ffprobe failed")
-            except:
-                # Fallback: use ffmpeg to get duration
-                probe_cmd = [ffmpeg_path, '-i', audio_temp.name, '-f', 'null', '-']
-                probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+                # Quick duration check with shorter timeout
+                probe_cmd = [ffmpeg_exe, '-i', audio_temp.name, '-f', 'null', '-', '-t', '0.1']
+                probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10)
                 
                 # Parse duration from stderr
                 duration_match = re.search(r'Duration: (\d+):(\d+):(\d+\.\d+)', probe_result.stderr)
@@ -161,7 +158,13 @@ def transcribe_audio_ffmpeg(video_path: str, client: OpenAI, ffmpeg_path: str = 
                     h, m, s = duration_match.groups()
                     total_duration = int(h) * 3600 + int(m) * 60 + float(s)
                 else:
-                    total_duration = 3600  # Default 1 hour
+                    # Estimate from file size (rough: 1MB ≈ 8 minutes of 64k audio)
+                    total_duration = file_size_mb * 8 * 60
+                    st.info(f"Estimated audio duration: {total_duration/60:.1f} minutes")
+            except Exception:
+                # Final fallback
+                total_duration = 3600  # 1 hour default
+                st.warning("Using default duration estimate")
             
             chunk_num = 0
             start_time = 0
@@ -173,26 +176,42 @@ def transcribe_audio_ffmpeg(video_path: str, client: OpenAI, ffmpeg_path: str = 
                 duration = min(chunk_duration, total_duration - start_time)
                 
                 chunk_cmd = [
-                    ffmpeg_path, '-y', '-i', audio_temp.name,
+                    ffmpeg_exe, '-y', '-i', audio_temp.name,
                     '-ss', str(start_time), '-t', str(duration),
                     '-acodec', 'copy',
                     chunk_temp.name
                 ]
                 
-                subprocess.run(chunk_cmd, capture_output=True, timeout=120)
-                chunks.append(chunk_temp.name)
+                try:
+                    subprocess.run(chunk_cmd, capture_output=True, timeout=120)
+                    if os.path.exists(chunk_temp.name) and os.path.getsize(chunk_temp.name) > 1000:
+                        chunks.append(chunk_temp.name)
+                    else:
+                        st.warning(f"Chunk {chunk_num} failed or empty, skipping")
+                except subprocess.TimeoutExpired:
+                    st.warning(f"Chunk {chunk_num} timed out, skipping")
                 
                 start_time += chunk_duration
                 chunk_num += 1
+            
+            if not chunks:
+                raise Exception("No valid audio chunks created")
             
             # Transcribe chunks
             full_transcript = ""
             for i, chunk_path in enumerate(chunks):
                 st.info(f"Transcribing chunk {i+1}/{len(chunks)}...")
-                with open(chunk_path, "rb") as f:
-                    resp = client.audio.transcriptions.create(model="whisper-1", file=f)
-                full_transcript += resp.text + " "
-                os.unlink(chunk_path)  # Clean up chunk
+                try:
+                    with open(chunk_path, "rb") as f:
+                        resp = client.audio.transcriptions.create(model="whisper-1", file=f)
+                    full_transcript += resp.text + " "
+                except Exception as chunk_error:
+                    st.warning(f"Chunk {i+1} transcription failed: {chunk_error}")
+                finally:
+                    try:
+                        os.unlink(chunk_path)  # Clean up chunk
+                    except:
+                        pass
                 
         else:
             # Transcribe single file
@@ -201,11 +220,24 @@ def transcribe_audio_ffmpeg(video_path: str, client: OpenAI, ffmpeg_path: str = 
             full_transcript = resp.text
         
         # Clean up audio file
-        os.unlink(audio_temp.name)
+        try:
+            os.unlink(audio_temp.name)
+        except:
+            pass
+            
+        if not full_transcript.strip():
+            raise Exception("Transcription returned empty result")
+            
         return full_transcript.strip()
         
     except Exception as e:
         st.error(f"Transcription error: {str(e)}")
+        # Clean up on error
+        try:
+            if 'audio_temp' in locals():
+                os.unlink(audio_temp.name)
+        except:
+            pass
         raise
 
 
@@ -366,46 +398,18 @@ Generated by ClipMaker - AI-Powered Video Analysis
 
 
 def get_video_info(video_path: str, ffmpeg_path: str = 'ffmpeg') -> dict:
-    """Get video information using FFmpeg with better error handling."""
+    """Get video information using multiple fallback methods."""
     try:
-        # Try imageio-ffmpeg's ffprobe first if available
+        # Method 1: Try imageio-ffmpeg's ffmpeg with shorter timeout and specific flags
         try:
             import imageio_ffmpeg
-            ffprobe_path = imageio_ffmpeg.get_ffprobe_exe()
+            ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
             
-            # Use ffprobe (comes with ffmpeg) to get video info
-            cmd = [ffprobe_path, "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", video_path]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            # Use ffmpeg with minimal probing - just get basic info quickly
+            cmd = [ffmpeg_exe, "-hide_banner", "-i", video_path, "-t", "0.1", "-f", "null", "-"]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
             
-            if result.returncode == 0:
-                info = json.loads(result.stdout)
-                
-                # Find video stream
-                video_stream = None
-                for stream in info['streams']:
-                    if stream['codec_type'] == 'video':
-                        video_stream = stream
-                        break
-                
-                if not video_stream:
-                    raise Exception("No video stream found")
-                
-                return {
-                    'duration': float(info['format']['duration']),
-                    'width': int(video_stream['width']),
-                    'height': int(video_stream['height'])
-                }
-            else:
-                raise Exception("ffprobe failed")
-                
-        except Exception as ffprobe_error:
-            st.warning(f"ffprobe unavailable ({ffprobe_error}), trying ffmpeg fallback...")
-            
-            # Fallback: use ffmpeg to get duration
-            cmd = [ffmpeg_path, "-i", video_path, "-f", "null", "-"]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            
-            # Parse from stderr
+            # Parse from stderr even if command "fails" (it will because of -t 0.1)
             import re
             duration_match = re.search(r'Duration: (\d+):(\d+):(\d+\.\d+)', result.stderr)
             size_match = re.search(r'(\d+)x(\d+)', result.stderr)
@@ -415,22 +419,96 @@ def get_video_info(video_path: str, ffmpeg_path: str = 'ffmpeg') -> dict:
                 duration = int(h) * 3600 + int(m) * 60 + float(s)
                 width, height = size_match.groups()
                 
+                st.info(f"✅ Video info: {width}x{height}, {duration:.1f}s")
                 return {
                     'duration': duration,
                     'width': int(width),
                     'height': int(height)
                 }
             else:
-                # Last resort: return reasonable defaults
-                st.warning("Could not parse video info, using defaults")
-                return {
-                    'duration': 1800.0,  # 30 minutes default
-                    'width': 1920,
-                    'height': 1080
-                }
+                raise Exception("Could not parse ffmpeg output")
+                
+        except Exception as ffmpeg_error:
+            st.warning(f"imageio-ffmpeg failed: {str(ffmpeg_error)[:100]}...")
+            
+            # Method 2: Try system ffmpeg with very short timeout
+            try:
+                cmd = ['ffmpeg', "-hide_banner", "-i", video_path, "-t", "0.1", "-f", "null", "-"]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+                
+                # Parse from stderr
+                import re
+                duration_match = re.search(r'Duration: (\d+):(\d+):(\d+\.\d+)', result.stderr)
+                size_match = re.search(r'(\d+)x(\d+)', result.stderr)
+                
+                if duration_match and size_match:
+                    h, m, s = duration_match.groups()
+                    duration = int(h) * 3600 + int(m) * 60 + float(s)
+                    width, height = size_match.groups()
+                    
+                    st.info(f"✅ Video info (system): {width}x{height}, {duration:.1f}s")
+                    return {
+                        'duration': duration,
+                        'width': int(width),
+                        'height': int(height)
+                    }
+                else:
+                    raise Exception("Could not parse system ffmpeg output")
+                    
+            except Exception as system_error:
+                st.warning(f"System ffmpeg also failed: {str(system_error)[:100]}...")
+                
+                # Method 3: Use file-based estimation
+                try:
+                    file_size_mb = os.path.getsize(video_path) / (1024 * 1024)
+                    
+                    # Rough estimation based on file size
+                    # Average: ~1MB per minute for compressed video
+                    estimated_duration = max(60.0, file_size_mb * 60.0)  # At least 1 minute
+                    estimated_duration = min(estimated_duration, 7200.0)  # Max 2 hours
+                    
+                    st.warning(f"Using file size estimation: {file_size_mb:.1f}MB → ~{estimated_duration/60:.1f} minutes")
+                    
+                    return {
+                        'duration': estimated_duration,
+                        'width': 1920,  # Common default
+                        'height': 1080
+                    }
+                    
+                except Exception as file_error:
+                    st.warning(f"File size estimation failed: {file_error}")
+                    
+                    # Method 4: Ask user for duration as absolute fallback
+                    st.error("🚨 Could not analyze video automatically")
+                    
+                    user_duration = st.number_input(
+                        "Please enter video duration in minutes:",
+                        min_value=1.0,
+                        max_value=180.0,
+                        value=30.0,
+                        step=1.0,
+                        help="Estimate the length of your video in minutes"
+                    )
+                    
+                    if user_duration:
+                        duration_seconds = user_duration * 60
+                        st.info(f"Using user-provided duration: {duration_seconds:.1f}s")
+                        
+                        return {
+                            'duration': duration_seconds,
+                            'width': 1920,
+                            'height': 1080
+                        }
+                    else:
+                        # Final fallback
+                        return {
+                            'duration': 1800.0,  # 30 minutes
+                            'width': 1920,
+                            'height': 1080
+                        }
                 
     except Exception as e:
-        st.warning(f"Video analysis had issues: {str(e)}, using defaults")
+        st.error(f"Complete video analysis failure: {str(e)}")
         return {
             'duration': 1800.0,  # 30 minutes default
             'width': 1920,
