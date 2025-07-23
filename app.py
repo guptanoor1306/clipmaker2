@@ -377,7 +377,7 @@ def get_video_info(video_path: str, ffmpeg_path: str = 'ffmpeg') -> dict:
         if result.returncode != 0:
             # Fallback: try with ffmpeg
             cmd = [ffmpeg_path, '-i', video_path, '-f', 'null', '-']
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             
             # Parse from stderr
             import re
