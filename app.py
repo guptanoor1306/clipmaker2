@@ -1,4 +1,4 @@
-# app.py - FFmpeg-only ClipMaker (No MoviePy issues)
+# app.py - FFmpeg-only ClipMaker (Fixed ffprobe issue + improved parameters)
 import os
 import json
 import tempfile
@@ -26,35 +26,51 @@ def get_api_key() -> str:
 def get_system_prompt(platform: str, video_duration: float = None) -> str:
     duration_info = f"\n\nIMPORTANT: The video is {video_duration:.1f} seconds ({video_duration/60:.1f} minutes) long. All timestamps MUST be within 0 to {video_duration:.1f} seconds. Do not generate any timestamps beyond this range." if video_duration else ""
     
-    return f"""You are a content strategist and social media editor trained to analyze long-form video/podcast transcripts. Your task is to identify 15–60 second segments that are highly likely to perform well as short-form content on {platform}.
+    return f"""You are a content strategist and social media editor trained to analyze long-form video/podcast transcripts. Your task is to identify 20-59 second segments that are highly likely to perform well as short-form content on {platform}.
 
-You must base your cuts on emotional resonance, storytelling hooks, educational value, contrarian takes, humor, or surprise. 
+CRITICAL REQUIREMENTS:
+🎯 Duration: Each clip must be 20-59 seconds (no shorter, no longer)
+🪝 Hook: Every clip MUST start with a compelling 0-3 second hook that stops scrolling
+🎬 Flow: Complete narrative arc with smooth, non-abrupt ending
+📱 Context: Must make sense without prior video context
 
 Key Parameters for Cut Selection:
-🎯 Clarity of Message: Is the idea clearly and concisely explained?
-🧠 Educational Value: Does it provide insight, tip, or new perspective?
-😲 Surprise Factor: Is there a twist, unexpected truth, or myth-busting idea?
-😍 Emotional Impact: Does it make you feel something? (inspiration, laughter, shock)
-🔁 Replayability: Would a viewer want to watch this again?
-📉 Drop-off Resistance: Does it have a strong hook in the first 3 seconds?
-🧠 Relatability: Does it reflect common struggles, habits, or aspirations?
-🎤 Speaker Delivery: Energy, voice modulation, pauses
-🪞 Format Fit: Does it fit within 15-60 seconds and make sense out of context?
+🪝 HOOK STRENGTH (0-3 seconds): Shocking statement, question, bold claim, or visual grab
+🧠 Educational Value: Clear insight, tip, or new perspective delivered quickly  
+😲 Surprise Factor: Plot twist, myth-busting, or unexpected revelation
+😍 Emotional Impact: Inspiration, humor, shock, or relatability that drives engagement
+🔁 Replayability: Content viewers want to watch multiple times or share
+📉 Retention: Strong momentum throughout - no dead moments or filler
+🎯 Relatability: Reflects common struggles, desires, or experiences
+🎤 Speaker Energy: Passionate delivery, voice modulation, natural pauses
+🏁 Clean Ending: Natural conclusion, not mid-sentence or abrupt cutoff
+📱 Platform Fit: Perfect for {platform} audience and algorithm
+
+HOOK EXAMPLES (First 0-3 seconds):
+- "This will change how you think about..."
+- "Nobody talks about this, but..."
+- "I made a $10,000 mistake so you don't have to..."
+- "The thing they don't tell you is..."
+- Visual: Dramatic pause, gesture, or surprising action
 
 {duration_info}
 
-CRITICAL: Since you don't have access to actual timestamps, estimate reasonable time intervals based on the content flow and speech patterns. Assume an average speaking pace of 150-200 words per minute.
+CRITICAL: Since you don't have access to actual timestamps, estimate reasonable time intervals based on content flow and speech patterns. Assume average speaking pace of 150-200 words per minute.
 
 For each recommended cut, provide:
 1. Start and end timestamps (HH:MM:SS format) - MUST be within video duration
-2. Reason why this segment will work (based on above parameters)
-3. Predicted engagement score (0–100) — your confidence in performance
-4. Suggested caption for social media with emojis/hashtags
+2. Hook description (what happens in first 3 seconds)
+3. Content flow (brief summary of 20-59 second narrative)
+4. Reason for virality (based on parameters above)
+5. Predicted engagement score (0–100) — confidence in performance
+6. Suggested caption for social media with emojis/hashtags
 
 Output ONLY valid JSON as an array of objects with these exact keys:
 - start: "HH:MM:SS"
 - end: "HH:MM:SS" 
-- reason: "brief rationale focusing on virality factors"
+- hook: "description of compelling opening 0-3 seconds"
+- flow: "brief narrative arc of the full 20-59 second clip"
+- reason: "why this will go viral focusing on engagement factors"
 - score: integer (0-100)
 - caption: "social media caption with emojis and hashtags"
 
@@ -62,10 +78,12 @@ Example format:
 [
   {{
     "start": "00:02:15",
-    "end": "00:02:45",
-    "reason": "Myth-busting insight about credit scores that contradicts popular belief - high surprise factor and educational value",
+    "end": "00:03:02",
+    "hook": "Opens with shocking statistic that 90% of people get wrong",
+    "flow": "Hook → explains common misconception → reveals truth → actionable tip → strong finish",
+    "reason": "Myth-busting content with strong hook, educational value, and shareable insight that challenges assumptions",
     "score": 88,
-    "caption": "Wait... credit scores don't work how you think?! 😱 #MoneyMyths #FinanceTips #CreditScore"
+    "caption": "90% of people believe this financial myth 😱 The truth will shock you! #MoneyMyths #FinanceTips #Viral"
   }}
 ]"""
 
@@ -120,18 +138,30 @@ def transcribe_audio_ffmpeg(video_path: str, client: OpenAI, ffmpeg_path: str = 
             chunks = []
             chunk_duration = 600  # 10 minutes
             
-            # Get audio duration
-            probe_cmd = [ffmpeg_path, '-i', audio_temp.name, '-f', 'null', '-']
-            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
-            
-            # Parse duration from stderr
-            import re
-            duration_match = re.search(r'Duration: (\d+):(\d+):(\d+\.\d+)', probe_result.stderr)
-            if duration_match:
-                h, m, s = duration_match.groups()
-                total_duration = int(h) * 3600 + int(m) * 60 + float(s)
-            else:
-                total_duration = 3600  # Default 1 hour
+            # Get audio duration using ffprobe or ffmpeg
+            try:
+                # Try imageio-ffmpeg's ffprobe first
+                import imageio_ffmpeg
+                ffprobe_path = imageio_ffmpeg.get_ffprobe_exe()
+                probe_cmd = [ffprobe_path, '-v', 'quiet', '-print_format', 'json', '-show_format', audio_temp.name]
+                probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+                if probe_result.returncode == 0:
+                    info = json.loads(probe_result.stdout)
+                    total_duration = float(info['format']['duration'])
+                else:
+                    raise Exception("ffprobe failed")
+            except:
+                # Fallback: use ffmpeg to get duration
+                probe_cmd = [ffmpeg_path, '-i', audio_temp.name, '-f', 'null', '-']
+                probe_result = subprocess.run(probe_cmd, capture_output=True, text=True)
+                
+                # Parse duration from stderr
+                duration_match = re.search(r'Duration: (\d+):(\d+):(\d+\.\d+)', probe_result.stderr)
+                if duration_match:
+                    h, m, s = duration_match.groups()
+                    total_duration = int(h) * 3600 + int(m) * 60 + float(s)
+                else:
+                    total_duration = 3600  # Default 1 hour
             
             chunk_num = 0
             start_time = 0
@@ -161,14 +191,14 @@ def transcribe_audio_ffmpeg(video_path: str, client: OpenAI, ffmpeg_path: str = 
                 st.info(f"Transcribing chunk {i+1}/{len(chunks)}...")
                 with open(chunk_path, "rb") as f:
                     resp = client.audio.transcriptions.create(model="whisper-1", file=f)
-                full_transcript += resp + " "
+                full_transcript += resp.text + " "
                 os.unlink(chunk_path)  # Clean up chunk
                 
         else:
             # Transcribe single file
             with open(audio_temp.name, "rb") as f:
                 resp = client.audio.transcriptions.create(model="whisper-1", file=f)
-            full_transcript = resp
+            full_transcript = resp.text
         
         # Clean up audio file
         os.unlink(audio_temp.name)
@@ -177,7 +207,6 @@ def transcribe_audio_ffmpeg(video_path: str, client: OpenAI, ffmpeg_path: str = 
     except Exception as e:
         st.error(f"Transcription error: {str(e)}")
         raise
-
 
 
 def generate_clip_commands(video_path: str, start_time: float, end_time: float, make_vertical: bool = False) -> dict:
@@ -228,17 +257,20 @@ def create_instructions_file(selected_segments: list, video_filename: str, make_
 2. Place this file and your video in the same folder
 3. Open terminal/command prompt in that folder
 
-### Generated Clips:
+### Generated Clips (20-59 seconds each):
 
 """
         
         for i, segment in enumerate(selected_segments, 1):
             start_time = time_to_seconds(segment.get("start", "0"))
             end_time = time_to_seconds(segment.get("end", "0"))
+            duration = end_time - start_time
             
             instructions += f"""
 ## Clip {i} - Score: {segment.get('score', 0)}/100
-**Time:** {segment.get('start')} - {segment.get('end')} ({end_time - start_time:.1f}s)
+**Time:** {segment.get('start')} - {segment.get('end')} ({duration:.1f}s)
+**Hook:** {segment.get('hook', 'Strong opening hook')}
+**Flow:** {segment.get('flow', 'Complete narrative arc')}
 **Caption:** {segment.get('caption', '')}
 **Why it works:** {segment.get('reason', '')}
 
@@ -306,6 +338,7 @@ echo "All clips generated!"
 ```
 
 ### Notes:
+- All clips are 20-59 seconds with strong hooks and smooth endings
 - Replace the video filename in commands if your file has a different name
 - Adjust crop parameters if your video has different dimensions
 - All clips will be high quality with H.264 encoding
@@ -330,60 +363,45 @@ Generated by ClipMaker - AI-Powered Video Analysis
         
     except Exception as e:
         raise Exception(f"Instructions file creation failed: {str(e)}")
-    """Generate clip without FFmpeg - basic approach."""
-    try:
-        # Try MoviePy for basic clipping only
-        try:
-            from moviepy.video.io.VideoFileClip import VideoFileClip
-            
-            st.info(f"Creating clip: {start_time:.1f}s - {end_time:.1f}s")
-            
-            # Load video and create clip
-            video = VideoFileClip(video_path)
-            clip = video.subclip(start_time, end_time)
-            
-            # Create output file
-            temp_clip = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-            temp_clip.close()
-            
-            # Write clip (horizontal only without FFmpeg)
-            if make_vertical:
-                st.warning("Vertical conversion requires FFmpeg. Creating horizontal clip.")
-            
-            clip.write_videofile(temp_clip.name, codec='libx264', audio_codec='aac')
-            
-            # Clean up
-            clip.close()
-            video.close()
-            
-            return temp_clip.name
-            
-        except ImportError:
-            raise Exception("No video processing tools available")
-        except Exception as e:
-            raise Exception(f"Clip generation failed: {str(e)}")
-            
-    except Exception as e:
-        raise Exception(f"Simple clip generation failed: {str(e)}")
 
 
 def get_video_info(video_path: str, ffmpeg_path: str = 'ffmpeg') -> dict:
-    """Get video information using FFmpeg."""
+    """Get video information using FFmpeg with better error handling."""
     try:
-        # Try imageio-ffmpeg's ffprobe if available
+        # Try imageio-ffmpeg's ffprobe first if available
         try:
             import imageio_ffmpeg
             ffprobe_path = imageio_ffmpeg.get_ffprobe_exe()
-        except Exception:
-            # Fallback to system ffprobe
-            ffprobe_path = 'ffprobe'
-        
-        # Use ffprobe (comes with ffmpeg) to get video info
-        cmd = [ffprobe_path, "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", video_path]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        
-        if result.returncode != 0:
-            # Fallback: try with ffmpeg
+            
+            # Use ffprobe (comes with ffmpeg) to get video info
+            cmd = [ffprobe_path, "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", video_path]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode == 0:
+                info = json.loads(result.stdout)
+                
+                # Find video stream
+                video_stream = None
+                for stream in info['streams']:
+                    if stream['codec_type'] == 'video':
+                        video_stream = stream
+                        break
+                
+                if not video_stream:
+                    raise Exception("No video stream found")
+                
+                return {
+                    'duration': float(info['format']['duration']),
+                    'width': int(video_stream['width']),
+                    'height': int(video_stream['height'])
+                }
+            else:
+                raise Exception("ffprobe failed")
+                
+        except Exception as ffprobe_error:
+            st.warning(f"ffprobe unavailable ({ffprobe_error}), trying ffmpeg fallback...")
+            
+            # Fallback: use ffmpeg to get duration
             cmd = [ffmpeg_path, "-i", video_path, "-f", "null", "-"]
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
             
@@ -403,27 +421,21 @@ def get_video_info(video_path: str, ffmpeg_path: str = 'ffmpeg') -> dict:
                     'height': int(height)
                 }
             else:
-                raise Exception("Could not parse video info")
-            
-        info = json.loads(result.stdout)
-        
-        # Find video stream
-        video_stream = None
-        for stream in info['streams']:
-            if stream['codec_type'] == 'video':
-                video_stream = stream
-                break
-        
-        if not video_stream:
-            raise Exception("No video stream found")
-        
-        return {
-            'duration': float(info['format']['duration']),
-            'width': int(video_stream['width']),
-            'height': int(video_stream['height'])
-        }
+                # Last resort: return reasonable defaults
+                st.warning("Could not parse video info, using defaults")
+                return {
+                    'duration': 1800.0,  # 30 minutes default
+                    'width': 1920,
+                    'height': 1080
+                }
+                
     except Exception as e:
-        raise Exception(f"Video analysis failed: {str(e)}")
+        st.warning(f"Video analysis had issues: {str(e)}, using defaults")
+        return {
+            'duration': 1800.0,  # 30 minutes default
+            'width': 1920,
+            'height': 1080
+        }
 
 
 def generate_clip_ffmpeg(video_path: str, start_time: float, end_time: float, make_vertical: bool = True, ffmpeg_path: str = 'ffmpeg') -> str:
@@ -435,7 +447,7 @@ def generate_clip_ffmpeg(video_path: str, start_time: float, end_time: float, ma
         
         if make_vertical:
             # Get video info for cropping calculation
-            video_info = get_video_info(video_path)
+            video_info = get_video_info(video_path, ffmpeg_path)
             original_width = video_info['width']
             original_height = video_info['height']
             
@@ -511,12 +523,11 @@ def generate_clip_ffmpeg(video_path: str, start_time: float, end_time: float, ma
         raise Exception(f"Clip generation failed: {str(e)}")
 
 
-
 def analyze_transcript(transcript: str, platform: str, client: OpenAI, video_duration: float = None) -> str:
     """Get segment suggestions via ChatCompletion."""
     messages = [
         {"role": "system", "content": get_system_prompt(platform, video_duration)},
-        {"role": "user", "content": f"Analyze this transcript and identify the best segments for {platform}. Remember the video is {video_duration:.1f} seconds long, so all timestamps must be within this range:\n\n{transcript}"}
+        {"role": "user", "content": f"Analyze this transcript and identify the best 20-59 second segments for {platform}. Each must start with a compelling hook in the first 3 seconds and end smoothly. Remember the video is {video_duration:.1f} seconds long, so all timestamps must be within this range:\n\n{transcript}"}
     ]
     
     try:
@@ -545,140 +556,28 @@ def parse_segments(text: str) -> list:
         
         segments = json.loads(text)
         
-        # Validate segments
+        # Validate segments and check duration
         valid_segments = []
         for seg in segments:
-            if all(key in seg for key in ["start", "end", "reason", "score", "caption"]):
-                valid_segments.append(seg)
+            required_keys = ["start", "end", "hook", "flow", "reason", "score", "caption"]
+            if all(key in seg for key in required_keys):
+                # Check duration is 20-59 seconds
+                start_time = time_to_seconds(seg.get("start", "0"))
+                end_time = time_to_seconds(seg.get("end", "0"))
+                duration = end_time - start_time
+                
+                if 20 <= duration <= 59:
+                    valid_segments.append(seg)
+                else:
+                    st.warning(f"Skipping segment {seg.get('start')}-{seg.get('end')} (duration: {duration:.1f}s, should be 20-59s)")
             else:
-                st.warning(f"Skipping invalid segment: {seg}")
+                st.warning(f"Skipping invalid segment: missing required fields")
         
         return valid_segments
     except json.JSONDecodeError as e:
         st.error(f"JSON parse error: {e}")
         st.error(f"Raw text received: {text[:500]}...")
         return []
-
-
-def get_video_info(video_path: str, ffmpeg_path: str = 'ffmpeg') -> dict:
-    """Get video information using FFmpeg."""
-    try:
-        # Try imageio-ffmpeg's ffprobe if available
-        import imageio_ffmpeg
-        ffprobe_path = imageio_ffmpeg.get_ffprobe_exe()
-    except Exception:
-        # Fallback to system ffprobe
-        ffprobe_path = 'ffprobe'
-        cmd = [ffprobe_path, "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", video_path]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        
-        if result.returncode != 0:
-            raise Exception("Could not read video file")
-            
-        info = json.loads(result.stdout)
-        
-        # Find video stream
-        video_stream = None
-        for stream in info['streams']:
-            if stream['codec_type'] == 'video':
-                video_stream = stream
-                break
-        
-        if not video_stream:
-            raise Exception("No video stream found")
-        
-        return {
-            'duration': float(info['format']['duration']),
-            'width': int(video_stream['width']),
-            'height': int(video_stream['height'])
-        }
-    except Exception as e:
-        raise Exception(f"Video analysis failed: {str(e)}")
-
-
-def generate_clip_ffmpeg(video_path: str, start_time: float, end_time: float, make_vertical: bool = True) -> str:
-    """Generate a clip using FFmpeg only."""
-    try:
-        # Create output file
-        temp_clip = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4")
-        temp_clip.close()
-        
-        if make_vertical:
-            # Get video info for cropping calculation
-            video_info = get_video_info(video_path)
-            original_width = video_info['width']
-            original_height = video_info['height']
-            
-            # Calculate center crop for 9:16
-            target_width = 1080
-            target_height = 1920
-            target_ratio = target_width / target_height
-            original_ratio = original_width / original_height
-            
-            if original_ratio > target_ratio:
-                # Horizontal video - crop from center
-                crop_width = int(original_height * target_ratio)
-                crop_x = (original_width - crop_width) // 2
-                
-                cmd = [
-                    'ffmpeg', '-y', 
-                    '-i', video_path,
-                    '-ss', str(start_time),
-                    '-t', str(end_time - start_time),
-                    '-vf', f'crop={crop_width}:{original_height}:{crop_x}:0,scale={target_width}:{target_height}',
-                    '-c:a', 'aac',
-                    '-c:v', 'libx264',
-                    '-preset', 'fast',
-                    '-crf', '23',
-                    temp_clip.name
-                ]
-            else:
-                # Already vertical - just scale
-                cmd = [
-                    'ffmpeg', '-y',
-                    '-i', video_path,
-                    '-ss', str(start_time),
-                    '-t', str(end_time - start_time),
-                    '-vf', f'scale={target_width}:{target_height}',
-                    '-c:a', 'aac',
-                    '-c:v', 'libx264',
-                    '-preset', 'fast',
-                    '-crf', '23',
-                    temp_clip.name
-                ]
-        else:
-            # Horizontal clip
-            cmd = [
-                'ffmpeg', '-y',
-                '-i', video_path,
-                '-ss', str(start_time),
-                '-t', str(end_time - start_time),
-                '-c:a', 'aac',
-                '-c:v', 'libx264',
-                '-preset', 'fast',
-                '-crf', '23',
-                temp_clip.name
-            ]
-        
-        # Execute FFmpeg
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        
-        if result.returncode != 0:
-            raise Exception(f"FFmpeg failed: {result.stderr}")
-        
-        if not os.path.isfile(temp_clip.name) or os.path.getsize(temp_clip.name) < 1000:
-            raise Exception("Output file not created or too small")
-        
-        return temp_clip.name
-        
-    except Exception as e:
-        # Clean up on failure
-        try:
-            if os.path.exists(temp_clip.name):
-                os.unlink(temp_clip.name)
-        except:
-            pass
-        raise Exception(f"Clip generation failed: {str(e)}")
 
 
 def display_segment_selector(segments: list) -> list:
@@ -696,11 +595,17 @@ def display_segment_selector(segments: list) -> list:
     sorted_segments = sorted(segments, key=lambda x: x.get('score', 0), reverse=True)
     
     for i, segment in enumerate(sorted_segments[:10], 1):  # Show top 10
-        with st.expander(f"🎬 Clip {i} - Score: {segment.get('score', 0)}/100", expanded=i <= 3):
+        start_time = time_to_seconds(segment.get("start", "0"))
+        end_time = time_to_seconds(segment.get("end", "0"))
+        duration = end_time - start_time
+        
+        with st.expander(f"🎬 Clip {i} - Score: {segment.get('score', 0)}/100 ({duration:.1f}s)", expanded=i <= 3):
             col1, col2 = st.columns([3, 1])
             
             with col1:
-                st.write(f"**⏱️ Time:** {segment.get('start')} - {segment.get('end')}")
+                st.write(f"**⏱️ Time:** {segment.get('start')} - {segment.get('end')} ({duration:.1f}s)")
+                st.write(f"**🪝 Hook:** {segment.get('hook', 'Strong opening hook')}")
+                st.write(f"**🎬 Flow:** {segment.get('flow', 'Complete narrative')}")
                 st.write(f"**📝 Caption:** {segment.get('caption', 'No caption')}")
                 st.write(f"**💡 Why this will work:** {segment.get('reason', 'No reason provided')}")
             
@@ -800,7 +705,7 @@ def main():
     st.set_page_config(page_title="ClipMaker", layout="wide")
     
     st.title("🎬 Long‑form to Short‑form ClipMaker")
-    st.markdown("Transform your long-form content into viral short-form clips using AI-powered analysis!")
+    st.markdown("Transform your long-form content into viral short-form clips (20-59s) with compelling hooks!")
 
     # Load & validate API Key
     API_KEY = get_api_key()
@@ -968,11 +873,7 @@ def main():
         progress_bar.progress(10)
         
         try:
-            if ffmpeg_available:
-                video_info = get_video_info(video_path, ffmpeg_path)
-            else:
-                # Fallback values for instructions mode
-                video_info = {'duration': 3600.0, 'width': 3840, 'height': 2160}
+            video_info = get_video_info(video_path, ffmpeg_path if ffmpeg_available else 'ffmpeg')
             st.success(f"✅ Video: {video_info['width']}x{video_info['height']}, {video_info['duration']:.1f}s")
         except Exception as e:
             st.error(f"Video analysis failed: {str(e)}")
@@ -988,7 +889,7 @@ def main():
             else:
                 # Simple fallback transcription
                 st.warning("Limited transcription without FFmpeg")
-                transcript = "Transcript not available without FFmpeg. Please install imageio-ffmpeg."
+                transcript = "Transcript not available without FFmpeg. Please install imageio-ffmpeg for full functionality."
             st.success("✅ Transcription complete")
         except Exception as e:
             st.error(f"Transcription failed: {str(e)}")
@@ -1000,7 +901,7 @@ def main():
             st.text_area("Full Transcript", transcript, height=200, disabled=True)
 
         # Step 3: AI analysis
-        status_text.text("🤖 Analyzing transcript for viral segments...")
+        status_text.text("🤖 Analyzing transcript for viral 20-59s segments with hooks...")
         progress_bar.progress(75)
         
         try:
@@ -1026,7 +927,7 @@ def main():
         progress_bar.progress(100)
         status_text.text("✅ Analysis complete! Select clips below.")
         
-        st.success(f"🎯 Found {len(segments)} potential clips!")
+        st.success(f"🎯 Found {len(segments)} potential clips (20-59s each with hooks)!")
 
     # Check if we have analyzed segments to display
     if 'ai_segments' in st.session_state and st.session_state.get('video_analyzed', False):
@@ -1061,8 +962,9 @@ def main():
                         try:
                             start_time = time_to_seconds(segment.get("start", "0"))
                             end_time = time_to_seconds(segment.get("end", "0"))
+                            duration = end_time - start_time
                             
-                            st.info(f"Creating clip {segment.get('display_index', i)}: {start_time:.1f}s - {end_time:.1f}s")
+                            st.info(f"Creating clip {segment.get('display_index', i)}: {start_time:.1f}s - {end_time:.1f}s ({duration:.1f}s)")
                             
                             # Generate clip with FFmpeg
                             clip_path = generate_clip_ffmpeg(video_path, start_time, end_time, make_vertical, ffmpeg_path)
@@ -1073,10 +975,12 @@ def main():
                                 "path": clip_path,
                                 "caption": segment.get("caption", ""),
                                 "score": segment.get("score", 0),
+                                "hook": segment.get("hook", "Strong opening hook"),
+                                "flow": segment.get("flow", "Complete narrative arc"),
                                 "reason": segment.get("reason", ""),
                                 "start": segment.get("start"),
                                 "end": segment.get("end"),
-                                "duration": f"{end_time - start_time:.1f}s",
+                                "duration": f"{duration:.1f}s",
                                 "format": "Vertical 9:16" if make_vertical else "Original",
                                 "file_size": f"{file_size_mb:.1f}MB",
                                 "index": segment.get('display_index', i)
@@ -1101,6 +1005,12 @@ def main():
                                 st.write(f"🎯 **Score:** {clip_info['score']}/100")
                                 st.write(f"📱 **Format:** {clip_info['format']}")
                                 st.write(f"💾 **Size:** {clip_info['file_size']}")
+                                
+                                st.markdown("**🪝 Hook:**")
+                                st.write(clip_info['hook'])
+                                
+                                st.markdown("**🎬 Flow:**")
+                                st.write(clip_info['flow'])
                                 
                                 st.markdown("**💡 Why this will work:**")
                                 st.write(clip_info['reason'])
@@ -1148,7 +1058,6 @@ def main():
                         st.error("❌ No clips were successfully generated.")
             else:
                 # Generate instructions instead
-            # Generate selected clips button
                 if st.button(f"🚀 Generate Instructions for {len(selected_segments)} Selected Clips", type="primary"):
                     st.markdown("---")
                     st.header("📋 Clip Generation Instructions")
@@ -1166,28 +1075,29 @@ def main():
                         instructions_file = create_instructions_file(selected_segments, video_filename, make_vertical)
                         
                         # Display preview of selected clips
-                        st.subheader("📝 Selected Clips Summary")
+                        st.subheader("📝 Selected Clips Summary (20-59s with Hooks)")
                         
                         for i, segment in enumerate(selected_segments, 1):
-                            with st.expander(f"🎬 Clip {i} - Score: {segment.get('score', 0)}/100", expanded=False):
+                            start_time = time_to_seconds(segment.get("start", "0"))
+                            end_time = time_to_seconds(segment.get("end", "0"))
+                            duration = end_time - start_time
+                            
+                            with st.expander(f"🎬 Clip {i} - Score: {segment.get('score', 0)}/100 ({duration:.1f}s)", expanded=False):
                                 col1, col2 = st.columns([2, 1])
                                 
                                 with col1:
-                                    st.write(f"**⏱️ Time:** {segment.get('start')} - {segment.get('end')}")
+                                    st.write(f"**⏱️ Time:** {segment.get('start')} - {segment.get('end')} ({duration:.1f}s)")
+                                    st.write(f"**🪝 Hook:** {segment.get('hook', 'Strong opening hook')}")
+                                    st.write(f"**🎬 Flow:** {segment.get('flow', 'Complete narrative arc')}")
                                     st.write(f"**📝 Caption:** {segment.get('caption', '')}")
                                     st.write(f"**💡 Why this works:** {segment.get('reason', '')}")
                                 
                                 with col2:
-                                    start_time = time_to_seconds(segment.get("start", "0"))
-                                    end_time = time_to_seconds(segment.get("end", "0"))
-                                    
-                                    st.write(f"**Duration:** {end_time - start_time:.1f}s")
-                                    
                                     # Show sample command
                                     if make_vertical:
-                                        sample_cmd = f'ffmpeg -i "your_video.mp4" -ss {start_time} -t {end_time - start_time} -vf "crop=1215:2160:1312:0,scale=1080:1920" -c:v libx264 -c:a aac "clip_{i}_vertical.mp4"'
+                                        sample_cmd = f'ffmpeg -i "your_video.mp4" -ss {start_time} -t {duration} -vf "crop=1215:2160:1312:0,scale=1080:1920" -c:v libx264 -c:a aac "clip_{i}_vertical.mp4"'
                                     else:
-                                        sample_cmd = f'ffmpeg -i "your_video.mp4" -ss {start_time} -t {end_time - start_time} -c:v libx264 -c:a aac "clip_{i}.mp4"'
+                                        sample_cmd = f'ffmpeg -i "your_video.mp4" -ss {start_time} -t {duration} -c:v libx264 -c:a aac "clip_{i}.mp4"'
                                     
                                     st.code(sample_cmd, language="bash")
                         
@@ -1217,6 +1127,7 @@ def main():
                             2. 🌐 Use **Kapwing.com** or **Canva.com**
                             3. 📤 Upload your video and crop to vertical
                             4. ⏰ Set the time ranges from our analysis
+                            5. 🪝 Ensure strong hooks in first 3 seconds
                             """)
                         
                         with col2:
@@ -1226,6 +1137,7 @@ def main():
                             2. 💻 Install FFmpeg on your computer
                             3. 🎬 Run the provided commands
                             4. 📱 Get perfect Instagram-ready clips!
+                            5. 🪝 Each clip has optimized hooks and flow
                             """)
                         
                         # Online alternatives
@@ -1234,13 +1146,13 @@ def main():
                         st.markdown("""
                         | Tool | Best For | Link |
                         |------|----------|------|
-                        | **Kapwing** | Easy vertical conversion | kapwing.com |
+                        | **Kapwing** | Easy vertical conversion + hooks | kapwing.com |
                         | **Canva** | Templates + video editing | canva.com |
                         | **ClipChamp** | Microsoft's editor | clipchamp.com |
-                        | **InShot** | Mobile app | Download from app store |
+                        | **InShot** | Mobile app with hook features | Download from app store |
                         """)
                         
-                        st.success("🎉 Instructions generated! Use the FFmpeg commands or online tools to create your viral clips!")
+                        st.success("🎉 Instructions generated! Use the FFmpeg commands or online tools to create your viral clips with compelling hooks!")
                         
                         # Clean up
                         try:
@@ -1250,8 +1162,6 @@ def main():
                             
                     except Exception as e:
                         st.error(f"Failed to generate instructions: {str(e)}")
-                        
-                    return  # Don't try to generate actual clips
     
     # Display previously generated clips if they exist
     if 'generated_clips' in st.session_state and st.session_state.generated_clips:
@@ -1277,6 +1187,12 @@ def main():
                 st.write(f"🎯 **Score:** {clip_info['score']}/100")
                 st.write(f"📱 **Format:** {clip_info['format']}")
                 st.write(f"💾 **Size:** {clip_info['file_size']}")
+                
+                st.markdown("**🪝 Hook:**")
+                st.write(clip_info.get('hook', 'Strong opening hook'))
+                
+                st.markdown("**🎬 Flow:**")
+                st.write(clip_info.get('flow', 'Complete narrative arc'))
                 
                 st.markdown("**💡 Why this will work:**")
                 st.write(clip_info['reason'])
