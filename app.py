@@ -1,4 +1,4 @@
-# app.py - MoviePy ClipMaker (User-selected parameters + Auto-generation)
+# app.py - MoviePy ClipMaker (Fixed for memory and stability issues)
 import os
 import json
 import tempfile
@@ -9,6 +9,7 @@ from moviepy.video.io.VideoFileClip import VideoFileClip
 import gdown
 import time
 from openai import OpenAI
+import gc  # Add garbage collection
 
 # ----------
 # Helper Functions
@@ -85,6 +86,8 @@ For each recommended cut, provide:
 5. Predicted engagement score (0–100) — confidence in performance
 6. Suggested caption for social media with emojis/hashtags
 
+IMPORTANT: Only return the TOP 5 best segments to avoid overwhelming processing.
+
 Output ONLY valid JSON as an array of objects with these exact keys:
 - start: "HH:MM:SS"
 - end: "HH:MM:SS" 
@@ -139,12 +142,17 @@ def extract_audio_from_video(video_path: str) -> str:
         audio.write_audiofile(
             audio_temp.name,
             codec='mp3',
-            bitrate='64k'  # Lower bitrate to reduce file size
+            bitrate='64k',  # Lower bitrate to reduce file size
+            verbose=False,  # Reduce logging
+            logger=None     # Suppress MoviePy logs
         )
         
-        # Clean up
+        # Clean up immediately
         audio.close()
         video.close()
+        
+        # Force garbage collection
+        gc.collect()
         
         return audio_temp.name
     except Exception as e:
@@ -180,12 +188,14 @@ def split_audio_file(audio_path: str, chunk_duration_minutes: int = 10) -> list:
             
             # Create chunk
             chunk_temp = tempfile.NamedTemporaryFile(delete=False, suffix=f"_chunk_{chunk_num}.mp3")
-            chunk_audio = audio_clip.subclip(start_time, end_time)
+            chunk_audio = audio_clip.subclipped(start_time, end_time)
             
             chunk_audio.write_audiofile(
                 chunk_temp.name,
                 codec='mp3',
-                bitrate='64k'
+                bitrate='64k',
+                verbose=False,
+                logger=None
             )
             
             chunks.append(chunk_temp.name)
@@ -195,6 +205,8 @@ def split_audio_file(audio_path: str, chunk_duration_minutes: int = 10) -> list:
             chunk_num += 1
         
         audio_clip.close()
+        gc.collect()  # Force garbage collection
+        
         st.success(f"Split audio into {len(chunks)} chunks")
         return chunks
         
@@ -240,7 +252,7 @@ def transcribe_audio(path: str, client: OpenAI) -> str:
                 
                 progress_bar.progress((i + 1) / len(audio_chunks))
                 
-                # Clean up chunk file
+                # Clean up chunk file immediately
                 try:
                     os.unlink(chunk_path)
                 except:
@@ -402,19 +414,23 @@ def parse_segments(text: str, video_duration: float = None) -> list:
 
 
 def generate_clips(video_path: str, segments: list, make_vertical: bool = False) -> list:
-    """Use moviepy to cut video segments - simplified version."""
+    """Use moviepy to cut video segments - FIXED for memory and stability."""
     clips = []
+    main_video = None
     
     try:
-        # Load video once
-        video = VideoFileClip(video_path)
-        total_duration = video.duration
-        original_width = video.w
-        original_height = video.h
+        # Load video once and keep reference
+        st.info("Loading main video...")
+        main_video = VideoFileClip(video_path)
+        total_duration = main_video.duration
+        original_width = main_video.w
+        original_height = main_video.h
         
         st.info(f"Video: {original_width}x{original_height}, {total_duration:.1f}s")
         
+        # Process clips one by one with proper cleanup
         for i, seg in enumerate(segments, start=1):
+            clip = None
             try:
                 start_time = time_to_seconds(seg.get("start", "0"))
                 end_time = time_to_seconds(seg.get("end", "0"))
@@ -443,24 +459,35 @@ def generate_clips(video_path: str, segments: list, make_vertical: bool = False)
                     st.warning(f"Skipping segment {i}: Clip too short")
                     continue
                 
-                # Create clip - use the working method we found
-                clip = video.subclipped(start_time, end_time)
+                # Create clip using subclipped method
+                clip = main_video.subclipped(start_time, end_time)
                 
-                # Skip vertical conversion for now to avoid crashes
+                # Skip vertical conversion for stability
                 if make_vertical:
-                    st.info(f"Vertical conversion skipped for compatibility - clip {i} will be horizontal")
+                    st.info(f"Vertical conversion skipped for stability - clip {i} will be horizontal")
                 
-                # Create temporary file
+                # Create temporary file with unique name
                 temp_file = tempfile.NamedTemporaryFile(
                     delete=False, 
                     suffix=".mp4",
                     prefix=f"clip_{i}_"
                 )
+                temp_file.close()  # Close file handle immediately
                 
                 st.info(f"Writing clip {i} to file...")
                 
-                # Use the simplest write method possible
-                clip.write_videofile(temp_file.name)
+                # Write video with optimized settings for stability
+                clip.write_videofile(
+                    temp_file.name,
+                    codec='libx264',
+                    audio_codec='aac',
+                    temp_audiofile=None,  # Don't create temp audio file
+                    remove_temp=True,     # Clean up temp files
+                    verbose=False,        # Reduce logging
+                    logger=None,          # Suppress MoviePy logs
+                    preset='ultrafast',   # Fastest encoding
+                    threads=1             # Single thread for stability
+                )
                 
                 # Verify file was created
                 if os.path.isfile(temp_file.name) and os.path.getsize(temp_file.name) > 0:
@@ -474,27 +501,41 @@ def generate_clips(video_path: str, segments: list, make_vertical: bool = False)
                         "start": seg.get("start"),
                         "end": seg.get("end"),
                         "duration": f"{end_time - start_time:.1f}s",
-                        "format": "Horizontal (Original)" if not make_vertical else "Horizontal (Vertical conversion not available)",
+                        "format": "Horizontal (Original)",
                         "index": i
                     })
                     st.success(f"✅ Created clip {i}")
                 else:
                     st.error(f"Failed to create clip {i}: File not generated")
                 
-                # Close clip to free memory
-                clip.close()
-                
             except Exception as e:
                 st.error(f"Error creating clip {i}: {str(e)}")
-                # Continue with next clip
                 continue
-        
-        # Close video to free memory
-        video.close()
+            finally:
+                # CRITICAL: Close clip immediately to free memory
+                if clip is not None:
+                    try:
+                        clip.close()
+                    except:
+                        pass
+                # Force garbage collection after each clip
+                gc.collect()
+                
+                # Add small delay to prevent overwhelming the system
+                time.sleep(0.5)
         
     except Exception as e:
         st.error(f"Error processing video: {str(e)}")
         raise
+    finally:
+        # CRITICAL: Always close the main video
+        if main_video is not None:
+            try:
+                main_video.close()
+            except:
+                pass
+        # Final garbage collection
+        gc.collect()
     
     return clips
 
@@ -618,12 +659,10 @@ def main():
     else:
         st.sidebar.success(f"✅ {len(selected_parameters)} parameters selected")
     
-    # Vertical clips option
-    make_vertical = st.sidebar.checkbox(
-        "Create Vertical Clips (9:16)", 
-        value=True,
-        help="Convert to vertical format perfect for Instagram Reels/TikTok"
-    )
+    # Vertical clips option - DISABLED for stability
+    st.sidebar.markdown("---")
+    st.sidebar.info("📱 **Note:** Vertical conversion disabled for stability. Clips will be in original format.")
+    make_vertical = False  # Force to False
     
     # Store in session state for use in functions
     st.session_state['selected_parameters'] = selected_parameters
@@ -743,7 +782,7 @@ def main():
             col2.metric("Avg Score", f"{avg_score:.1f}/100")
             col3.metric("Total Duration", f"{total_duration:.1f}s")
             col4.metric("Total Size", f"{total_size_mb:.1f}MB")
-            col5.metric("Format", "9:16 Vertical" if make_vertical else "Original")
+            col5.metric("Format", "Original (Horizontal)")
         
         # Display clips
         for clip_info in st.session_state.all_clips:
@@ -790,13 +829,12 @@ def main():
                 st.markdown("---")
                 if os.path.isfile(clip_info["path"]):
                     with open(clip_info["path"], "rb") as file:
-                        file_extension = "vertical" if make_vertical else "horizontal"
                         # Use unique key to prevent state issues
                         download_key = f"download_{clip_info['index']}_{hash(clip_info['path'])}"
                         st.download_button(
                             label="⬇️ Download Clip",
                             data=file,
-                            file_name=f"clip_{clip_info['index']}_{platform.replace(' ', '_').lower()}_{file_extension}.mp4",
+                            file_name=f"clip_{clip_info['index']}_{platform.replace(' ', '_').lower()}_horizontal.mp4",
                             mime="video/mp4",
                             use_container_width=True,
                             type="primary",
@@ -846,6 +884,7 @@ def main():
                 video_width = temp_video.w
                 video_height = temp_video.h
                 temp_video.close()
+                gc.collect()  # Clean up immediately
                 st.success(f"✅ Video: {video_width}x{video_height}, {video_duration:.1f}s")
             except Exception as e:
                 st.error(f"Video analysis failed: {str(e)}")
@@ -897,14 +936,14 @@ def main():
             segments_sorted = sorted(segments, key=lambda x: x.get('score', 0), reverse=True)
             
             # Step 5: Generate all clips automatically
-            status_text.text("✂️ Auto-generating all video clips...")
+            status_text.text("✂️ Auto-generating video clips...")
             progress_bar.progress(95)
             
-            st.success(f"🎯 Found {len(segments_sorted)} potential clips! Generating all clips automatically...")
+            st.success(f"🎯 Found {len(segments_sorted)} potential clips! Generating clips automatically...")
 
             st.markdown("---")
-            st.header("🎬 Auto-Generating All Clips")
-            st.info(f"🚀 Generating all {len(segments_sorted)} clips automatically based on your selected parameters")
+            st.header("🎬 Auto-Generating Clips")
+            st.info(f"🚀 Generating {len(segments_sorted)} clips automatically based on your selected parameters")
             
             try:
                 # Generate all clips
@@ -932,6 +971,8 @@ def main():
             except Exception as e:
                 st.error("❌ Clip generation failed")
                 st.error(f"Error: {str(e)}")
+                # Print full traceback for debugging
+                st.error(f"Traceback: {traceback.format_exc()}")
                 return
     else:
         st.info("🎯 Click 'Generate Clips' to start processing your video.")
@@ -953,6 +994,7 @@ def main():
             if key not in ['app_initialized', 'show_drive_warning']:  # Keep only essential app state
                 del st.session_state[key]
         st.session_state['current_step'] = 'upload'
+        gc.collect()  # Force garbage collection
         st.rerun()
 
 
