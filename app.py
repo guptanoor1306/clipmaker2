@@ -6,7 +6,6 @@ import traceback
 import re
 import streamlit as st
 from moviepy.video.io.VideoFileClip import VideoFileClip
-from moviepy.video.fx import resize
 import gdown
 import time
 from openai import OpenAI
@@ -400,22 +399,9 @@ def create_clips_moviepy(video_path: str, segments: list, make_vertical: bool = 
                 # Create subclip
                 clip = main_video.subclip(start_time, end_time)
                 
-                # Apply vertical format if requested
-                if make_vertical and original_width > original_height:
-                    # Calculate crop for 9:16 aspect ratio
-                    target_aspect = 9/16
-                    current_aspect = original_width / original_height
-                    
-                    if current_aspect > target_aspect:
-                        # Video is too wide, crop sides
-                        new_width = int(original_height * target_aspect)
-                        x_center = original_width // 2
-                        x1 = x_center - new_width // 2
-                        x2 = x_center + new_width // 2
-                        clip = clip.crop(x1=x1, x2=x2)
-                    
-                    # Resize to standard mobile size
-                    clip = clip.resize(height=1080)
+                # Skip vertical processing for now to ensure compatibility
+                if make_vertical:
+                    st.info(f"Vertical format requested but disabled for compatibility - clip {i} will be in original format")
                 
                 # Create temp file
                 temp_file = tempfile.NamedTemporaryFile(
@@ -438,7 +424,7 @@ def create_clips_moviepy(video_path: str, segments: list, make_vertical: bool = 
                 
                 # Verify file was created
                 if os.path.isfile(temp_file.name) and os.path.getsize(temp_file.name) > 0:
-                    format_info = "9:16 Vertical" if make_vertical else f"{original_width}x{original_height} Original"
+                    format_info = f"{original_width}x{original_height} Original"
                     
                     clips.append({
                         "path": temp_file.name,
@@ -581,13 +567,10 @@ def main():
     else:
         st.sidebar.success(f"✅ {len(selected_parameters)} selected")
 
-    # Vertical clips option
+    # Vertical clips option - temporarily disabled for compatibility
     st.sidebar.subheader("📱 Output Format")
-    make_vertical = st.sidebar.checkbox(
-        "Create Vertical Clips (9:16)", 
-        value=True,
-        help="Perfect for Instagram Reels, TikTok, YouTube Shorts"
-    )
+    st.sidebar.info("🔧 Vertical format temporarily disabled for compatibility - clips will be in original format")
+    make_vertical = False  # Force to False for now
 
     # Video source
     st.sidebar.subheader("📹 Video Source")
@@ -734,11 +717,10 @@ def main():
                 if os.path.isfile(clip_info["path"]):
                     with open(clip_info["path"], "rb") as file:
                         download_key = f"download_{clip_info['index']}_{hash(clip_info['path'])}"
-                        filename_format = "vertical" if make_vertical else "original"
                         st.download_button(
                             label="⬇️ Download Clip",
                             data=file,
-                            file_name=f"clip_{clip_info['index']}_{platform.replace(' ', '_').lower()}_{filename_format}.mp4",
+                            file_name=f"clip_{clip_info['index']}_{platform.replace(' ', '_').lower()}_original.mp4",
                             mime="video/mp4",
                             use_container_width=True,
                             type="primary",
@@ -838,8 +820,7 @@ def main():
 
                 st.markdown("---")
                 st.header("🎬 Creating Clips")
-                format_info = "9:16 vertical format" if make_vertical else "original format"
-                st.info(f"🚀 Generating clips in {format_info}")
+                st.info("🚀 Generating clips in original format for maximum compatibility")
                 
                 # Generate clips
                 all_clips = create_clips_moviepy(video_path, segments_sorted, make_vertical)
