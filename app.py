@@ -111,18 +111,18 @@ def seconds_to_time(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def extract_audio_safe(video_path: str) -> str:
-    """Extract audio with safe MoviePy settings."""
+def extract_audio_simple(video_path: str) -> str:
+    """Simple audio extraction with minimal settings."""
     video = None
     audio = None
     try:
         st.info("🎵 Extracting audio from video...")
         
         # Create temp file
-        audio_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
+        audio_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
         audio_temp.close()
         
-        # Load video with error handling
+        # Load video
         video = VideoFileClip(video_path)
         
         # Check if video has audio
@@ -131,14 +131,8 @@ def extract_audio_safe(video_path: str) -> str:
         
         audio = video.audio
         
-        # Write audio with safe settings
-        audio.write_audiofile(
-            audio_temp.name,
-            bitrate="128k",
-            fps=22050,
-            nbytes=2,
-            codec='pcm_s16le'  # Uncompressed for reliability
-        )
+        # Write audio with minimal settings
+        audio.write_audiofile(audio_temp.name)
         
         return audio_temp.name
         
@@ -146,7 +140,7 @@ def extract_audio_safe(video_path: str) -> str:
         st.error(f"Audio extraction failed: {str(e)}")
         raise
     finally:
-        # Always clean up
+        # Clean up
         if audio:
             try:
                 audio.close()
@@ -157,114 +151,35 @@ def extract_audio_safe(video_path: str) -> str:
                 video.close()
             except:
                 pass
-        # Force cleanup
         del audio, video
         gc.collect()
 
 
-def split_audio_safe(audio_path: str, chunk_minutes: int = 8) -> list:
-    """Split audio safely if too large."""
-    try:
-        file_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
-        
-        if file_size_mb <= 20:
-            return [audio_path]
-        
-        st.info(f"Audio file is {file_size_mb:.1f}MB. Splitting for Whisper...")
-        
-        from moviepy.audio.io.AudioFileClip import AudioFileClip
-        
-        audio_clip = None
-        try:
-            audio_clip = AudioFileClip(audio_path)
-            duration = audio_clip.duration
-            
-            chunk_duration = chunk_minutes * 60
-            chunks = []
-            
-            start_time = 0
-            chunk_num = 1
-            
-            while start_time < duration:
-                end_time = min(start_time + chunk_duration, duration)
-                
-                chunk_temp = tempfile.NamedTemporaryFile(delete=False, suffix=f"_chunk_{chunk_num}.wav")
-                chunk_temp.close()
-                
-                chunk_audio = audio_clip.subclip(start_time, end_time)
-                chunk_audio.write_audiofile(chunk_temp.name, codec='pcm_s16le')
-                chunk_audio.close()
-                
-                chunks.append(chunk_temp.name)
-                
-                start_time = end_time
-                chunk_num += 1
-            
-            st.success(f"Split audio into {len(chunks)} chunks")
-            return chunks
-            
-        finally:
-            if audio_clip:
-                audio_clip.close()
-            del audio_clip
-            gc.collect()
-        
-    except Exception as e:
-        st.error(f"Audio splitting failed: {str(e)}")
-        raise
-
-
-def transcribe_audio_robust(video_path: str, client: OpenAI) -> str:
-    """Robust audio transcription."""
+def transcribe_audio_simple(video_path: str, client: OpenAI) -> str:
+    """Simple transcription without chunking to avoid errors."""
     try:
         # Extract audio
-        audio_path = extract_audio_safe(video_path)
+        audio_path = extract_audio_simple(video_path)
         
-        # Check size and split if needed
+        # Check file size
         file_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
         st.info(f"Audio file size: {file_size_mb:.1f}MB")
         
-        audio_chunks = split_audio_safe(audio_path) if file_size_mb > 20 else [audio_path]
+        # If file is too large, warn user but try anyway
+        if file_size_mb > 25:
+            st.warning(f"Audio file is {file_size_mb:.1f}MB (limit is 25MB). Transcription may fail.")
+            st.info("💡 Try using a shorter video if transcription fails.")
         
-        # Transcribe
-        full_transcript = ""
+        # Single file transcription
+        st.info("Transcribing audio file...")
+        with open(audio_path, "rb") as f:
+            resp = client.audio.transcriptions.create(
+                model="whisper-1", 
+                file=f,
+                response_format="text"
+            )
         
-        if len(audio_chunks) > 1:
-            st.info(f"Transcribing {len(audio_chunks)} chunks...")
-            progress_bar = st.progress(0)
-            
-            for i, chunk_path in enumerate(audio_chunks):
-                try:
-                    with open(chunk_path, "rb") as f:
-                        resp = client.audio.transcriptions.create(
-                            model="whisper-1", 
-                            file=f,
-                            response_format="text"
-                        )
-                    
-                    chunk_transcript = resp.strip()
-                    if chunk_transcript:
-                        full_transcript += chunk_transcript + " "
-                    
-                    progress_bar.progress((i + 1) / len(audio_chunks))
-                    
-                except Exception as e:
-                    st.warning(f"Chunk {i+1} transcription failed: {str(e)}")
-                
-                # Clean up chunk
-                try:
-                    os.unlink(chunk_path)
-                except:
-                    pass
-        else:
-            # Single file
-            with open(audio_chunks[0], "rb") as f:
-                resp = client.audio.transcriptions.create(
-                    model="whisper-1", 
-                    file=f,
-                    response_format="text"
-                )
-            full_transcript = resp
+        full_transcript = resp.strip()
         
         # Clean up
         try:
@@ -272,10 +187,17 @@ def transcribe_audio_robust(video_path: str, client: OpenAI) -> str:
         except:
             pass
         
-        return full_transcript.strip()
+        return full_transcript
         
     except Exception as e:
         st.error(f"Transcription error: {str(e)}")
+        # Provide helpful suggestions
+        if "413" in str(e) or "too large" in str(e).lower():
+            st.error("💡 Audio file too large for Whisper API. Try using a shorter video (under 10 minutes).")
+        elif "401" in str(e):
+            st.error("💡 Check your OpenAI API key and account credits.")
+        elif "429" in str(e):
+            st.error("💡 Rate limit hit. Wait a moment and try again.")
         raise
 
 
@@ -397,7 +319,7 @@ def create_clips_moviepy(video_path: str, segments: list, make_vertical: bool = 
                     continue
                 
                 # Create subclip
-                clip = main_video.subclip(start_time, end_time)
+                clip = main_video.subclipped(start_time, end_time)
                 
                 # Skip vertical processing for now to ensure compatibility
                 if make_vertical:
@@ -779,7 +701,7 @@ def main():
                 status_text.text("🎤 Transcribing audio...")
                 progress_bar.progress(25)
                 
-                transcript = transcribe_audio_robust(video_path, client)
+                transcript = transcribe_audio_simple(video_path, client)
                 st.success("✅ Transcription complete")
                 
                 # Show transcript
