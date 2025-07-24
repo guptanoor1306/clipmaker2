@@ -142,9 +142,7 @@ def extract_audio_from_video(video_path: str) -> str:
         audio.write_audiofile(
             audio_temp.name,
             codec='mp3',
-            bitrate='64k',  # Lower bitrate to reduce file size
-            verbose=False,  # Reduce logging
-            logger=None     # Suppress MoviePy logs
+            bitrate='64k'  # Lower bitrate to reduce file size
         )
         
         # Clean up immediately
@@ -193,9 +191,7 @@ def split_audio_file(audio_path: str, chunk_duration_minutes: int = 10) -> list:
             chunk_audio.write_audiofile(
                 chunk_temp.name,
                 codec='mp3',
-                bitrate='64k',
-                verbose=False,
-                logger=None
+                bitrate='64k'
             )
             
             chunks.append(chunk_temp.name)
@@ -482,11 +478,7 @@ def generate_clips(video_path: str, segments: list, make_vertical: bool = False)
                     codec='libx264',
                     audio_codec='aac',
                     temp_audiofile=None,  # Don't create temp audio file
-                    remove_temp=True,     # Clean up temp files
-                    verbose=False,        # Reduce logging
-                    logger=None,          # Suppress MoviePy logs
-                    preset='ultrafast',   # Fastest encoding
-                    threads=1             # Single thread for stability
+                    remove_temp=True      # Clean up temp files
                 )
                 
                 # Verify file was created
