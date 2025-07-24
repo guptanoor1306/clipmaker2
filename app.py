@@ -474,19 +474,46 @@ def generate_clips(video_path: str, segments: list, make_vertical: bool = False)
                 
                 # Apply vertical conversion if requested
                 if make_vertical:
-                    # Calculate crop for 9:16 aspect ratio
-                    target_ratio = 9/16  # width/height for vertical
-                    current_ratio = clip.w / clip.h
-                    
-                    if current_ratio > target_ratio:
-                        # Video is too wide, crop from sides
-                        new_width = int(clip.h * target_ratio)
-                        x_center = clip.w / 2
-                        x1 = int(x_center - new_width / 2)
-                        clip = clip.crop(x1=x1, width=new_width)
-                    
-                    # Resize to standard vertical dimensions (1080x1920)
-                    clip = clip.resize((1080, 1920))
+                    try:
+                        # Calculate crop for 9:16 aspect ratio
+                        target_ratio = 9/16  # width/height for vertical
+                        current_ratio = clip.w / clip.h
+                        
+                        if current_ratio > target_ratio:
+                            # Video is too wide, crop from sides
+                            new_width = int(clip.h * target_ratio)
+                            x_center = clip.w / 2
+                            x1 = int(x_center - new_width / 2)
+                            
+                            # Try different cropping methods based on MoviePy version
+                            if hasattr(clip, 'crop'):
+                                clip = clip.crop(x1=x1, width=new_width)
+                            elif hasattr(clip, 'fx'):
+                                # Use fx.crop for older versions
+                                try:
+                                    from moviepy.video.fx import crop
+                                    clip = clip.fx(crop, x1=x1, width=new_width)
+                                except ImportError:
+                                    st.warning(f"Crop not available for clip {i}, keeping original aspect ratio")
+                            else:
+                                st.warning(f"Crop method not available for clip {i}, keeping original aspect ratio")
+                        
+                        # Resize to standard vertical dimensions (1080x1920)
+                        if hasattr(clip, 'resize'):
+                            clip = clip.resize((1080, 1920))
+                        elif hasattr(clip, 'fx'):
+                            # Use fx.resize for older versions
+                            try:
+                                from moviepy.video.fx import resize
+                                clip = clip.fx(resize, (1080, 1920))
+                            except ImportError:
+                                st.warning(f"Resize not available for clip {i}, keeping original size")
+                        else:
+                            st.warning(f"Resize method not available for clip {i}, keeping original size")
+                            
+                    except Exception as vertical_error:
+                        st.warning(f"Vertical conversion failed for clip {i}: {vertical_error}. Using original format.")
+                        # Continue with original clip without vertical conversion
                 
                 # Create temporary file
                 temp_file = tempfile.NamedTemporaryFile(
