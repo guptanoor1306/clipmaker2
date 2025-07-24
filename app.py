@@ -402,7 +402,7 @@ def parse_segments(text: str, video_duration: float = None) -> list:
 
 
 def generate_clips(video_path: str, segments: list, make_vertical: bool = False) -> list:
-    """Use moviepy to cut video segments with optional vertical conversion."""
+    """Use moviepy to cut video segments - simplified version."""
     clips = []
     
     try:
@@ -413,9 +413,6 @@ def generate_clips(video_path: str, segments: list, make_vertical: bool = False)
         original_height = video.h
         
         st.info(f"Video: {original_width}x{original_height}, {total_duration:.1f}s")
-        
-        # Debug: Check available methods
-        st.info(f"Available VideoFileClip methods: {[method for method in dir(video) if 'clip' in method.lower()]}")
         
         for i, seg in enumerate(segments, start=1):
             try:
@@ -431,89 +428,27 @@ def generate_clips(video_path: str, segments: list, make_vertical: bool = False)
                 
                 # Validate times
                 if start_time >= end_time:
-                    st.warning(f"Skipping segment {i}: Invalid time range ({start_time:.1f}s >= {end_time:.1f}s)")
+                    st.warning(f"Skipping segment {i}: Invalid time range")
                     continue
                     
                 if start_time >= total_duration:
-                    st.warning(f"Skipping segment {i}: Start time ({start_time:.1f}s) beyond video duration ({total_duration:.1f}s)")
+                    st.warning(f"Skipping segment {i}: Start time beyond video duration")
                     continue
                     
                 if end_time > total_duration:
-                    st.warning(f"Adjusting segment {i}: End time beyond video duration")
                     end_time = total_duration
                 
                 # Ensure minimum clip duration
                 if end_time - start_time < 1:
-                    st.warning(f"Skipping segment {i}: Clip too short ({end_time - start_time:.1f}s)")
+                    st.warning(f"Skipping segment {i}: Clip too short")
                     continue
                 
-                # Create clip using the correct method based on the working file
-                try:
-                    # Method 1: Try the most common method first
-                    if hasattr(video, 'subclip'):
-                        st.info(f"Using subclip method for clip {i}")
-                        clip = video.subclip(start_time, end_time)
-                    elif hasattr(video, 'subclipped'):
-                        st.info(f"Using subclipped method for clip {i}")
-                        clip = video.subclipped(start_time, end_time)
-                    else:
-                        st.info(f"Using cutout method for clip {i}")
-                        # Fallback method from working file
-                        clip = video.cutout(0, start_time).cutout(end_time - start_time, video.duration)
-                        
-                except AttributeError as attr_error:
-                    st.error(f"MoviePy method error for clip {i}: {str(attr_error)}")
-                    # Try alternative approach from working file
-                    try:
-                        st.info(f"Trying fx.subclip for clip {i}")
-                        from moviepy.video.fx import subclip
-                        clip = subclip(video, start_time, end_time)
-                    except (ImportError, AttributeError) as fx_error:
-                        st.error(f"Could not create clip {i} with any method: {fx_error}")
-                        continue  # Skip this clip
+                # Create clip - use the working method we found
+                clip = video.subclipped(start_time, end_time)
                 
-                # Apply vertical conversion if requested
+                # Skip vertical conversion for now to avoid crashes
                 if make_vertical:
-                    try:
-                        # Calculate crop for 9:16 aspect ratio
-                        target_ratio = 9/16  # width/height for vertical
-                        current_ratio = clip.w / clip.h
-                        
-                        if current_ratio > target_ratio:
-                            # Video is too wide, crop from sides
-                            new_width = int(clip.h * target_ratio)
-                            x_center = clip.w / 2
-                            x1 = int(x_center - new_width / 2)
-                            
-                            # Try different cropping methods based on MoviePy version
-                            if hasattr(clip, 'crop'):
-                                clip = clip.crop(x1=x1, width=new_width)
-                            elif hasattr(clip, 'fx'):
-                                # Use fx.crop for older versions
-                                try:
-                                    from moviepy.video.fx import crop
-                                    clip = clip.fx(crop, x1=x1, width=new_width)
-                                except ImportError:
-                                    st.warning(f"Crop not available for clip {i}, keeping original aspect ratio")
-                            else:
-                                st.warning(f"Crop method not available for clip {i}, keeping original aspect ratio")
-                        
-                        # Resize to standard vertical dimensions (1080x1920)
-                        if hasattr(clip, 'resize'):
-                            clip = clip.resize((1080, 1920))
-                        elif hasattr(clip, 'fx'):
-                            # Use fx.resize for older versions
-                            try:
-                                from moviepy.video.fx import resize
-                                clip = clip.fx(resize, (1080, 1920))
-                            except ImportError:
-                                st.warning(f"Resize not available for clip {i}, keeping original size")
-                        else:
-                            st.warning(f"Resize method not available for clip {i}, keeping original size")
-                            
-                    except Exception as vertical_error:
-                        st.warning(f"Vertical conversion failed for clip {i}: {vertical_error}. Using original format.")
-                        # Continue with original clip without vertical conversion
+                    st.info(f"Vertical conversion skipped for compatibility - clip {i} will be horizontal")
                 
                 # Create temporary file
                 temp_file = tempfile.NamedTemporaryFile(
@@ -524,29 +459,8 @@ def generate_clips(video_path: str, segments: list, make_vertical: bool = False)
                 
                 st.info(f"Writing clip {i} to file...")
                 
-                # Write video file with compatible settings for older MoviePy versions
-                try:
-                    clip.write_videofile(
-                        temp_file.name, 
-                        codec="libx264", 
-                        audio_codec="aac",
-                        temp_audiofile_path=tempfile.gettempdir(),
-                        preset='medium',
-                        fps=30
-                    )
-                except Exception as write_error:
-                    st.error(f"Error writing clip {i} with preset: {str(write_error)}")
-                    # Try simpler encoding without preset
-                    try:
-                        clip.write_videofile(
-                            temp_file.name, 
-                            codec="libx264", 
-                            audio_codec="aac"
-                        )
-                    except Exception as simple_error:
-                        st.error(f"Error writing clip {i} with simple settings: {str(simple_error)}")
-                        # Try most basic encoding
-                        clip.write_videofile(temp_file.name)
+                # Use the simplest write method possible
+                clip.write_videofile(temp_file.name)
                 
                 # Verify file was created
                 if os.path.isfile(temp_file.name) and os.path.getsize(temp_file.name) > 0:
@@ -560,7 +474,7 @@ def generate_clips(video_path: str, segments: list, make_vertical: bool = False)
                         "start": seg.get("start"),
                         "end": seg.get("end"),
                         "duration": f"{end_time - start_time:.1f}s",
-                        "format": "Vertical 9:16" if make_vertical else "Original",
+                        "format": "Horizontal (Original)" if not make_vertical else "Horizontal (Vertical conversion not available)",
                         "index": i
                     })
                     st.success(f"✅ Created clip {i}")
@@ -572,6 +486,7 @@ def generate_clips(video_path: str, segments: list, make_vertical: bool = False)
                 
             except Exception as e:
                 st.error(f"Error creating clip {i}: {str(e)}")
+                # Continue with next clip
                 continue
         
         # Close video to free memory
