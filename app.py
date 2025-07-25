@@ -674,3 +674,58 @@ def display_clips(clips: list, platform: str, start_index: int = 0, max_clips: i
     
     for i, clip in enumerate(clips_to_show, start=start_index + 1):
         # Use unique keys to maintain state
+        clip_key = f"clip_{start_index}_{i}"
+        
+        col1, col2 = st.columns([2, 1])
+        
+        with col1:
+            st.subheader(f"Clip #{i} (Score: {clip.get('score', 0)}/100)")
+            
+            # Check if video file exists before trying to display
+            video_path = clip.get("path")
+            if video_path and os.path.isfile(video_path):
+                try:
+                    # Don't use key parameter for st.video - it's not supported in all versions
+                    st.video(video_path)
+                except Exception as video_error:
+                    st.error(f"Error displaying video for clip {i}: {str(video_error)}")
+                    st.info("Video file may have been corrupted. Try regenerating clips.")
+            else:
+                st.error(f"Video file not found for clip {i}. Please regenerate clips.")
+                st.info(f"Expected path: {video_path}")
+            
+            # Caption with copy button
+            st.markdown("**📝 Suggested Caption:**")
+            st.code(clip.get("caption", "No caption available"), language="text")
+            
+        with col2:
+            st.markdown("**📊 Details:**")
+            st.write(f"⏱️ **Duration:** {clip.get('duration', 'N/A')}")
+            st.write(f"🕐 **Time:** {clip.get('start', 'N/A')} - {clip.get('end', 'N/A')}")
+            st.write(f"🎯 **Score:** {clip.get('score', 0)}/100")
+            
+            st.markdown("**💡 Why this will work:**")
+            st.write(clip.get('reason', 'No reason provided'))
+            
+            # Download button with file existence check
+            video_path = clip.get("path")
+            if video_path and os.path.isfile(video_path):
+                try:
+                    with open(video_path, "rb") as file:
+                        file_data = file.read()
+                        st.download_button(
+                            label="⬇️ Download Clip",
+                            data=file_data,
+                            file_name=f"clip_{i}_{platform.replace(' ', '_').lower()}.mp4",
+                            mime="video/mp4",
+                            use_container_width=True,
+                            key=f"download_{clip_key}"
+                        )
+                except Exception as download_error:
+                    st.error(f"Error preparing download for clip {i}: {str(download_error)}")
+            else:
+                st.error("❌ File not available for download")
+                if st.button(f"🔄 Regenerate Clip {i}", key=f"regen_{clip_key}"):
+                    st.info("Please use 'Generate Clips' to recreate all clips.")
+        
+        st.markdown("---")
