@@ -247,121 +247,86 @@ def parse_segments(text: str, video_duration: float = None) -> list:
         return []
 
 
-def create_single_clip_no_write(video_path: str, start_time: float, end_time: float, output_path: str) -> bool:
-    """Create clip without using write_videofile - save as raw frames."""
-    import cv2
-    import numpy as np
-    
-    try:
-        st.info(f"Creating clip using frame extraction method...")
-        
-        # Open video with OpenCV
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            st.error("Could not open video with OpenCV")
-            return False
-        
-        # Get video properties
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        
-        # Calculate frame numbers
-        start_frame = int(start_time * fps)
-        end_frame = int(end_time * fps)
-        
-        # Set up video writer
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-        
-        # Set to start frame
-        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
-        
-        frame_count = 0
-        target_frames = end_frame - start_frame
-        
-        while frame_count < target_frames:
-            ret, frame = cap.read()
-            if not ret:
-                break
-            
-            out.write(frame)
-            frame_count += 1
-        
-        # Clean up
-        cap.release()
-        out.release()
-        
-        # Verify file was created
-        success = os.path.isfile(output_path) and os.path.getsize(output_path) > 0
-        if success:
-            st.success(f"Created clip using OpenCV: {os.path.getsize(output_path)} bytes")
-        
-        return success
-        
-    except ImportError:
-        st.error("OpenCV not available. Falling back to minimal MoviePy...")
-        return create_single_clip_minimal_moviepy(video_path, start_time, end_time, output_path)
-    except Exception as e:
-        st.error(f"OpenCV clip creation failed: {str(e)}")
-        return False
-
-
-def create_single_clip_minimal_moviepy(video_path: str, start_time: float, end_time: float, output_path: str) -> bool:
-    """Absolute minimal MoviePy approach as fallback."""
+def create_single_clip_imageio_only(video_path: str, start_time: float, end_time: float, output_path: str) -> bool:
+    """Create clip using only imageio and MoviePy frame extraction."""
     video = None
     clip = None
     
     try:
-        st.info("Using minimal MoviePy fallback...")
+        st.info(f"Creating clip using imageio method...")
+        
+        # Load video with MoviePy (just for frame extraction)
+        video = VideoFileClip(video_path)
+        clip = video.subclipped(start_time, end_time)
+        
+        # Get video properties
+        fps = clip.fps
+        duration = clip.duration
+        
+        st.info(f"Extracting {duration:.1f}s at {fps} fps...")
+        
+        # Extract all frames at once
+        frames = list(clip.iter_frames())
+        
+        if len(frames) == 0:
+            st.error("No frames extracted")
+            return False
+        
+        st.info(f"Extracted {len(frames)} frames, creating video...")
+        
+        # Use imageio to create video (more stable than MoviePy write)
+        try:
+            import imageio
+            with imageio.get_writer(output_path, fps=fps) as writer:
+                for frame in frames:
+                    writer.append_data(frame)
+            
+            st.info(f"Video written with imageio")
+            
+        except ImportError:
+            st.error("imageio not available, trying basic approach...")
+            return create_single_clip_basic_moviepy(video_path, start_time, end_time, output_path)
+        
+        return os.path.isfile(output_path) and os.path.getsize(output_path) > 0
+        
+    except Exception as e:
+        st.error(f"imageio method failed: {str(e)}")
+        return create_single_clip_basic_moviepy(video_path, start_time, end_time, output_path)
+        
+    finally:
+        if clip:
+            try:
+                clip.close()
+            except:
+                pass
+        if video:
+            try:
+                video.close()
+            except:
+                pass
+        del clip, video
+        gc.collect()
+
+
+def create_single_clip_basic_moviepy(video_path: str, start_time: float, end_time: float, output_path: str) -> bool:
+    """Most basic MoviePy approach possible."""
+    video = None
+    clip = None
+    
+    try:
+        st.info("Using most basic MoviePy approach...")
         
         # Load and create subclip
         video = VideoFileClip(video_path)
         clip = video.subclipped(start_time, end_time)
         
-        # Save as individual frames to avoid write_videofile
-        frames_dir = tempfile.mkdtemp()
-        frame_paths = []
-        
-        # Extract frames
-        for i, frame in enumerate(clip.iter_frames()):
-            frame_path = os.path.join(frames_dir, f"frame_{i:06d}.png")
-            # Save frame as PNG
-            from PIL import Image
-            Image.fromarray(frame).save(frame_path)
-            frame_paths.append(frame_path)
-        
-        # Recreate video from frames using basic method
-        if len(frame_paths) > 0:
-            # Create a simple video from frames
-            first_frame = Image.open(frame_paths[0])
-            width, height = first_frame.size
-            
-            # Use imageio to create video (more reliable than MoviePy write)
-            import imageio
-            with imageio.get_writer(output_path, fps=24) as writer:
-                for frame_path in frame_paths:
-                    frame = imageio.imread(frame_path)
-                    writer.append_data(frame)
-            
-            # Clean up frames
-            for frame_path in frame_paths:
-                try:
-                    os.unlink(frame_path)
-                except:
-                    pass
-            try:
-                os.rmdir(frames_dir)
-            except:
-                pass
+        # Write with absolutely minimal settings
+        clip.write_videofile(output_path)
         
         return os.path.isfile(output_path) and os.path.getsize(output_path) > 0
         
-    except ImportError as e:
-        st.error(f"Required library not available: {str(e)}")
-        return False
     except Exception as e:
-        st.error(f"Minimal MoviePy failed: {str(e)}")
+        st.error(f"Basic MoviePy failed: {str(e)}")
         return False
         
     finally:
@@ -407,8 +372,8 @@ def create_clips_one_by_one(video_path: str, segments: list) -> list:
             temp_file_path = temp_file.name
             temp_file.close()
             
-            # Create clip with frame extraction method (no MoviePy write)
-            success = create_single_clip_no_write(
+            # Create clip with imageio method (no MoviePy write)
+            success = create_single_clip_imageio_only(
                 video_path, 
                 start_time, 
                 end_time, 
@@ -426,10 +391,10 @@ def create_clips_one_by_one(video_path: str, segments: list) -> list:
                     "start": seg.get("start"),
                     "end": seg.get("end"),
                     "duration": f"{duration:.1f}s",
-                    "format": "Frame-extracted Video (No audio)",
+                    "format": "imageio-generated Video",
                     "index": i
                 })
-                st.success(f"✅ Created clip {i} (frame-extracted)")
+                st.success(f"✅ Created clip {i} (imageio method)")
             else:
                 st.error(f"❌ Failed to create clip {i}")
                 try:
@@ -491,8 +456,8 @@ def main():
     st.title("🎬 Long‑form to Short‑form ClipMaker")
     st.markdown("Transform your long-form content into viral short-form clips (20-59s) with compelling hooks!")
 
-    st.warning("⚠️ **Alternative Processing Mode**: Uses frame extraction instead of MoviePy video writing to prevent crashes.")
-    st.info("✅ This approach is much more stable and reliable for clip generation.")
+    st.warning("⚠️ **Optimized Processing**: Uses imageio for video generation to prevent MoviePy crashes.")
+    st.info("✅ This approach extracts frames and rebuilds video files more reliably.")
 
     # Initialize session state
     for key in ['clips_generated', 'all_clips', 'processing_complete']:
@@ -631,7 +596,7 @@ def main():
         clips = st.session_state.all_clips
         if clips:
             st.success(f"🎉 Successfully generated {len(clips)} clips!")
-            st.info("💡 **Note**: Audio was removed for stability. You can add audio back using any video editor.")
+            st.info("💡 **Note**: Clips generated without audio for stability. Add audio using any video editor.")
             
             # Summary stats
             total_duration = sum(float(c.get('duration', '0').replace('s', '')) for c in clips)
@@ -653,7 +618,7 @@ def main():
             with video_col:
                 if os.path.isfile(clip_info["path"]):
                     st.video(clip_info["path"])
-                    st.caption("🔇 Frame-extracted video - add audio in editor")
+                    st.caption("🎬 Generated with imageio")
                 else:
                     st.error("❌ Clip file no longer available")
             
@@ -798,7 +763,7 @@ def main():
 
                 st.markdown("---")
                 st.header("🎬 Creating Clips")
-                st.info("🚀 Generating clips using frame extraction method")
+                st.info("🚀 Generating clips using imageio method")
                 
                 all_clips = create_clips_one_by_one(video_path, segments_sorted)
                 
