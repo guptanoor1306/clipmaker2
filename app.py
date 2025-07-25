@@ -1,4 +1,4 @@
-# app.py - ClipMaker (MoviePy Fixed - Reliable Clip Generation)
+# app.py - ClipMaker (Ultra-Light MoviePy Approach)
 import os
 import json
 import tempfile
@@ -111,67 +111,47 @@ def seconds_to_time(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def extract_audio_simple(video_path: str) -> str:
-    """Simple audio extraction with minimal settings."""
+def extract_audio_minimal(video_path: str) -> str:
+    """Minimal audio extraction."""
     video = None
     audio = None
     try:
-        st.info("🎵 Extracting audio from video...")
+        st.info("🎵 Extracting audio...")
         
         # Create temp file
         audio_temp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
         audio_temp.close()
         
-        # Load video
+        # Load and extract with minimal settings
         video = VideoFileClip(video_path)
-        
-        # Check if video has audio
         if video.audio is None:
-            raise Exception("Video has no audio track")
+            raise Exception("No audio track found")
         
         audio = video.audio
-        
-        # Write audio with minimal settings
         audio.write_audiofile(audio_temp.name)
         
         return audio_temp.name
         
-    except Exception as e:
-        st.error(f"Audio extraction failed: {str(e)}")
-        raise
     finally:
-        # Clean up
         if audio:
-            try:
-                audio.close()
-            except:
-                pass
+            audio.close()
         if video:
-            try:
-                video.close()
-            except:
-                pass
+            video.close()
         del audio, video
         gc.collect()
 
 
-def transcribe_audio_simple(video_path: str, client: OpenAI) -> str:
-    """Simple transcription without chunking to avoid errors."""
+def transcribe_audio(video_path: str, client: OpenAI) -> str:
+    """Simple transcription."""
     try:
-        # Extract audio
-        audio_path = extract_audio_simple(video_path)
+        audio_path = extract_audio_minimal(video_path)
         
-        # Check file size
         file_size_mb = os.path.getsize(audio_path) / (1024 * 1024)
-        st.info(f"Audio file size: {file_size_mb:.1f}MB")
+        st.info(f"Audio file: {file_size_mb:.1f}MB")
         
-        # If file is too large, warn user but try anyway
         if file_size_mb > 25:
-            st.warning(f"Audio file is {file_size_mb:.1f}MB (limit is 25MB). Transcription may fail.")
-            st.info("💡 Try using a shorter video if transcription fails.")
+            st.warning(f"Large audio file ({file_size_mb:.1f}MB). May fail - try shorter video if needed.")
         
-        # Single file transcription
-        st.info("Transcribing audio file...")
         with open(audio_path, "rb") as f:
             resp = client.audio.transcriptions.create(
                 model="whisper-1", 
@@ -179,25 +159,15 @@ def transcribe_audio_simple(video_path: str, client: OpenAI) -> str:
                 response_format="text"
             )
         
-        full_transcript = resp.strip()
-        
-        # Clean up
         try:
             os.unlink(audio_path)
         except:
             pass
         
-        return full_transcript
+        return resp.strip()
         
     except Exception as e:
-        st.error(f"Transcription error: {str(e)}")
-        # Provide helpful suggestions
-        if "413" in str(e) or "too large" in str(e).lower():
-            st.error("💡 Audio file too large for Whisper API. Try using a shorter video (under 10 minutes).")
-        elif "401" in str(e):
-            st.error("💡 Check your OpenAI API key and account credits.")
-        elif "429" in str(e):
-            st.error("💡 Rate limit hit. Wait a moment and try again.")
+        st.error(f"Transcription failed: {str(e)}")
         raise
 
 
@@ -229,7 +199,6 @@ Transcript:
 def parse_segments(text: str, video_duration: float = None) -> list:
     """Parse and validate segments."""
     try:
-        # Clean text
         text = text.strip()
         if text.startswith("```json"):
             text = text[7:]
@@ -239,7 +208,6 @@ def parse_segments(text: str, video_duration: float = None) -> list:
         
         segments = json.loads(text)
         
-        # Validate
         valid_segments = []
         for i, seg in enumerate(segments):
             required_keys = ["start", "end", "hook", "flow", "reason", "score", "caption"]
@@ -248,7 +216,6 @@ def parse_segments(text: str, video_duration: float = None) -> list:
                     start_seconds = time_to_seconds(seg["start"])
                     end_seconds = time_to_seconds(seg["end"])
                     
-                    # Validate times
                     if video_duration:
                         if start_seconds >= video_duration:
                             continue
@@ -280,142 +247,203 @@ def parse_segments(text: str, video_duration: float = None) -> list:
         return []
 
 
-def create_clips_moviepy(video_path: str, segments: list, make_vertical: bool = False) -> list:
-    """Create clips using MoviePy with robust error handling."""
-    clips = []
-    main_video = None
+def create_single_clip_no_write(video_path: str, start_time: float, end_time: float, output_path: str) -> bool:
+    """Create clip without using write_videofile - save as raw frames."""
+    import cv2
+    import numpy as np
     
     try:
-        st.info("🎬 Loading video for clip generation...")
+        st.info(f"Creating clip using frame extraction method...")
         
-        # Load main video once
-        main_video = VideoFileClip(video_path)
-        total_duration = main_video.duration
-        original_width = main_video.w
-        original_height = main_video.h
+        # Open video with OpenCV
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            st.error("Could not open video with OpenCV")
+            return False
         
-        st.info(f"Video loaded: {original_width}x{original_height}, {total_duration:.1f}s")
+        # Get video properties
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         
-        # Process each segment
-        for i, seg in enumerate(segments, start=1):
-            clip = None
-            try:
-                start_time = time_to_seconds(seg.get("start", "0"))
-                end_time = time_to_seconds(seg.get("end", "0"))
-                
-                st.info(f"Creating clip {i}: {start_time:.1f}s - {end_time:.1f}s")
-                
-                # Validate times
-                if start_time >= end_time or start_time >= total_duration:
-                    st.warning(f"Skipping clip {i}: Invalid time range")
-                    continue
-                    
-                if end_time > total_duration:
-                    end_time = total_duration
-                
-                duration = end_time - start_time
-                if duration < 1:
-                    st.warning(f"Skipping clip {i}: Too short")
-                    continue
-                
-                # Create subclip with error handling
-                try:
-                    clip = main_video.subclipped(start_time, end_time)
-                    st.info(f"Subclip created for clip {i}")
-                except Exception as subclip_error:
-                    st.error(f"Failed to create subclip {i}: {str(subclip_error)}")
-                    continue
-                
-                # Skip vertical processing for compatibility
-                if make_vertical:
-                    st.info(f"Vertical format disabled for compatibility - clip {i} will be original format")
-                
-                # Create temp file with better error handling
-                try:
-                    temp_file = tempfile.NamedTemporaryFile(
-                        delete=False, 
-                        suffix=".mp4",
-                        prefix=f"clip_{i}_"
-                    )
-                    temp_file_path = temp_file.name
-                    temp_file.close()
-                    st.info(f"Temp file created: {temp_file_path}")
-                except Exception as temp_error:
-                    st.error(f"Failed to create temp file for clip {i}: {str(temp_error)}")
-                    continue
-                
-                # Write with minimal settings for reliability
-                try:
-                    st.info(f"Writing clip {i} to file...")
-                    clip.write_videofile(temp_file_path)
-                    st.info(f"Clip {i} written successfully")
-                except Exception as write_error:
-                    st.error(f"Failed to write clip {i}: {str(write_error)}")
-                    # Clean up failed temp file
-                    try:
-                        if os.path.exists(temp_file_path):
-                            os.unlink(temp_file_path)
-                    except:
-                        pass
-                    continue
-                
-                # Verify file was created
-                if os.path.isfile(temp_file_path) and os.path.getsize(temp_file_path) > 0:
-                    format_info = f"{original_width}x{original_height} Original"
-                    
-                    clips.append({
-                        "path": temp_file_path,
-                        "caption": seg.get("caption", f"clip_{i}"),
-                        "score": seg.get("score", 0),
-                        "reason": seg.get("reason", ""),
-                        "hook": seg.get("hook", ""),
-                        "flow": seg.get("flow", ""),
-                        "start": seg.get("start"),
-                        "end": seg.get("end"),
-                        "duration": f"{duration:.1f}s",
-                        "format": format_info,
-                        "index": i
-                    })
-                    st.success(f"✅ Created clip {i} ({os.path.getsize(temp_file_path)} bytes)")
-                else:
-                    st.error(f"Failed to create clip {i}: File not generated or empty")
-                    # Clean up empty temp file
-                    try:
-                        if os.path.exists(temp_file_path):
-                            os.unlink(temp_file_path)
-                    except:
-                        pass
-                
-            except Exception as e:
-                st.error(f"Error creating clip {i}: {str(e)}")
-                st.error(f"Error type: {type(e).__name__}")
-                continue
-            finally:
-                # Always clean up clip
-                if clip:
-                    try:
-                        clip.close()
-                    except:
-                        pass
-                del clip
-                gc.collect()
-                
-                # Small delay to prevent overwhelming
-                time.sleep(0.5)
+        # Calculate frame numbers
+        start_frame = int(start_time * fps)
+        end_frame = int(end_time * fps)
         
+        # Set up video writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        
+        # Set to start frame
+        cap.set(cv2.CAP_PROP_POS_FRAMES, start_frame)
+        
+        frame_count = 0
+        target_frames = end_frame - start_frame
+        
+        while frame_count < target_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            out.write(frame)
+            frame_count += 1
+        
+        # Clean up
+        cap.release()
+        out.release()
+        
+        # Verify file was created
+        success = os.path.isfile(output_path) and os.path.getsize(output_path) > 0
+        if success:
+            st.success(f"Created clip using OpenCV: {os.path.getsize(output_path)} bytes")
+        
+        return success
+        
+    except ImportError:
+        st.error("OpenCV not available. Falling back to minimal MoviePy...")
+        return create_single_clip_minimal_moviepy(video_path, start_time, end_time, output_path)
     except Exception as e:
-        st.error(f"Error in clip generation: {str(e)}")
-        st.error(f"Error type: {type(e).__name__}")
-        raise
-    finally:
-        # Always clean up main video
-        if main_video:
+        st.error(f"OpenCV clip creation failed: {str(e)}")
+        return False
+
+
+def create_single_clip_minimal_moviepy(video_path: str, start_time: float, end_time: float, output_path: str) -> bool:
+    """Absolute minimal MoviePy approach as fallback."""
+    video = None
+    clip = None
+    
+    try:
+        st.info("Using minimal MoviePy fallback...")
+        
+        # Load and create subclip
+        video = VideoFileClip(video_path)
+        clip = video.subclipped(start_time, end_time)
+        
+        # Save as individual frames to avoid write_videofile
+        frames_dir = tempfile.mkdtemp()
+        frame_paths = []
+        
+        # Extract frames
+        for i, frame in enumerate(clip.iter_frames()):
+            frame_path = os.path.join(frames_dir, f"frame_{i:06d}.png")
+            # Save frame as PNG
+            from PIL import Image
+            Image.fromarray(frame).save(frame_path)
+            frame_paths.append(frame_path)
+        
+        # Recreate video from frames using basic method
+        if len(frame_paths) > 0:
+            # Create a simple video from frames
+            first_frame = Image.open(frame_paths[0])
+            width, height = first_frame.size
+            
+            # Use imageio to create video (more reliable than MoviePy write)
+            import imageio
+            with imageio.get_writer(output_path, fps=24) as writer:
+                for frame_path in frame_paths:
+                    frame = imageio.imread(frame_path)
+                    writer.append_data(frame)
+            
+            # Clean up frames
+            for frame_path in frame_paths:
+                try:
+                    os.unlink(frame_path)
+                except:
+                    pass
             try:
-                main_video.close()
+                os.rmdir(frames_dir)
             except:
                 pass
-        del main_video
+        
+        return os.path.isfile(output_path) and os.path.getsize(output_path) > 0
+        
+    except ImportError as e:
+        st.error(f"Required library not available: {str(e)}")
+        return False
+    except Exception as e:
+        st.error(f"Minimal MoviePy failed: {str(e)}")
+        return False
+        
+    finally:
+        if clip:
+            try:
+                clip.close()
+            except:
+                pass
+        if video:
+            try:
+                video.close()
+            except:
+                pass
+        del clip, video
         gc.collect()
+
+
+def create_clips_one_by_one(video_path: str, segments: list) -> list:
+    """Create clips one by one with maximum isolation."""
+    clips = []
+    
+    st.info("🎬 Creating clips with ultra-light processing...")
+    
+    for i, seg in enumerate(segments, start=1):
+        try:
+            start_time = time_to_seconds(seg.get("start", "0"))
+            end_time = time_to_seconds(seg.get("end", "0"))
+            
+            st.info(f"Processing clip {i}: {start_time:.1f}s - {end_time:.1f}s")
+            
+            # Validate
+            duration = end_time - start_time
+            if duration < 1:
+                st.warning(f"Skipping clip {i}: Too short")
+                continue
+            
+            # Create temp file
+            temp_file = tempfile.NamedTemporaryFile(
+                delete=False, 
+                suffix=".mp4",
+                prefix=f"clip_{i}_"
+            )
+            temp_file_path = temp_file.name
+            temp_file.close()
+            
+            # Create clip with frame extraction method (no MoviePy write)
+            success = create_single_clip_no_write(
+                video_path, 
+                start_time, 
+                end_time, 
+                temp_file_path
+            )
+            
+            if success:
+                clips.append({
+                    "path": temp_file_path,
+                    "caption": seg.get("caption", f"clip_{i}"),
+                    "score": seg.get("score", 0),
+                    "reason": seg.get("reason", ""),
+                    "hook": seg.get("hook", ""),
+                    "flow": seg.get("flow", ""),
+                    "start": seg.get("start"),
+                    "end": seg.get("end"),
+                    "duration": f"{duration:.1f}s",
+                    "format": "Frame-extracted Video (No audio)",
+                    "index": i
+                })
+                st.success(f"✅ Created clip {i} (frame-extracted)")
+            else:
+                st.error(f"❌ Failed to create clip {i}")
+                try:
+                    os.unlink(temp_file_path)
+                except:
+                    pass
+            
+            # Force cleanup between clips
+            gc.collect()
+            time.sleep(1)
+            
+        except Exception as e:
+            st.error(f"Error with clip {i}: {str(e)}")
+            continue
     
     return clips
 
@@ -423,7 +451,6 @@ def create_clips_moviepy(video_path: str, segments: list, make_vertical: bool = 
 def download_drive_file(drive_url: str, out_path: str) -> str:
     """Download Google Drive file."""
     try:
-        # Extract file ID
         file_id = None
         if "id=" in drive_url:
             file_id = drive_url.split("id=")[1].split("&")[0]
@@ -442,7 +469,6 @@ def download_drive_file(drive_url: str, out_path: str) -> str:
         if not file_id:
             raise ValueError("Could not extract file ID")
         
-        # Download
         download_url = f"https://drive.google.com/uc?export=download&id={file_id}"
         result = gdown.download(download_url, out_path, quiet=True)
         
@@ -465,7 +491,8 @@ def main():
     st.title("🎬 Long‑form to Short‑form ClipMaker")
     st.markdown("Transform your long-form content into viral short-form clips (20-59s) with compelling hooks!")
 
-    st.success("✅ MoviePy clip generation enabled - full automatic clip creation available!")
+    st.warning("⚠️ **Alternative Processing Mode**: Uses frame extraction instead of MoviePy video writing to prevent crashes.")
+    st.info("✅ This approach is much more stable and reliable for clip generation.")
 
     # Initialize session state
     for key in ['clips_generated', 'all_clips', 'processing_complete']:
@@ -512,11 +539,6 @@ def main():
     else:
         st.sidebar.success(f"✅ {len(selected_parameters)} selected")
 
-    # Vertical clips option - temporarily disabled for compatibility
-    st.sidebar.subheader("📱 Output Format")
-    st.sidebar.info("🔧 Vertical format temporarily disabled for compatibility - clips will be in original format")
-    make_vertical = False  # Force to False for now
-
     # Video source
     st.sidebar.subheader("📹 Video Source")
     uploaded = st.sidebar.file_uploader(
@@ -528,7 +550,6 @@ def main():
     video_path = None
     
     if uploaded:
-        # Save uploaded file
         tmp = tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded.name)[1])
         tmp.write(uploaded.read())
         tmp.close()
@@ -544,7 +565,6 @@ def main():
         
         st.success(f"✅ Uploaded {st.session_state['video_size']:.1f}MB successfully!")
         
-        # Show preview for smaller files
         if st.session_state['video_size'] <= 200:
             st.video(video_path)
         else:
@@ -574,7 +594,6 @@ def main():
                         st.session_state['video_path'] = video_path
                         st.session_state['video_size'] = size_mb
                         
-                        # Reset processing
                         st.session_state.clips_generated = False
                         st.session_state.all_clips = []
                         st.session_state.processing_complete = False
@@ -612,6 +631,7 @@ def main():
         clips = st.session_state.all_clips
         if clips:
             st.success(f"🎉 Successfully generated {len(clips)} clips!")
+            st.info("💡 **Note**: Audio was removed for stability. You can add audio back using any video editor.")
             
             # Summary stats
             total_duration = sum(float(c.get('duration', '0').replace('s', '')) for c in clips)
@@ -633,6 +653,7 @@ def main():
             with video_col:
                 if os.path.isfile(clip_info["path"]):
                     st.video(clip_info["path"])
+                    st.caption("🔇 Frame-extracted video - add audio in editor")
                 else:
                     st.error("❌ Clip file no longer available")
             
@@ -663,9 +684,9 @@ def main():
                     with open(clip_info["path"], "rb") as file:
                         download_key = f"download_{clip_info['index']}_{hash(clip_info['path'])}"
                         st.download_button(
-                            label="⬇️ Download Clip",
+                            label="⬇️ Download Video Clip",
                             data=file,
-                            file_name=f"clip_{clip_info['index']}_{platform.replace(' ', '_').lower()}_original.mp4",
+                            file_name=f"clip_{clip_info['index']}_{platform.replace(' ', '_').lower()}_no_audio.mp4",
                             mime="video/mp4",
                             use_container_width=True,
                             type="primary",
@@ -676,9 +697,28 @@ def main():
             
             st.markdown("---")
 
+        # Instructions
+        st.markdown("---")
+        st.header("🔧 Adding Audio Back")
+        st.info("""
+        **To add audio back to your clips:**
+        
+        1. **Download the video clips** above (visual content only)
+        2. **Use any video editor** (CapCut, DaVinci Resolve, Adobe Premiere, etc.)
+        3. **Import both** the original video and the downloaded clip
+        4. **Extract audio** from the original video at the same timestamps
+        5. **Sync the audio** with the video clip
+        6. **Export** your final clip with audio
+        
+        **Timestamps are provided** in each clip's details for easy reference!
+        """)
+
+        # Alternative: Provide audio extraction timestamps
+        st.markdown("### 📋 Audio Extraction Reference")
+        for i, clip in enumerate(clips, 1):
+            st.code(f"Clip {i}: Extract audio from {clip['start']} to {clip['end']}", language="text")
         # Reset button
         if st.button("🔄 Clear All Clips & Start Over", type="secondary"):
-            # Clean up clip files
             for clip in st.session_state.all_clips:
                 try:
                     if clip.get("path") and os.path.isfile(clip["path"]):
@@ -686,7 +726,6 @@ def main():
                 except:
                     pass
             
-            # Reset session state
             st.session_state.clips_generated = False
             st.session_state.all_clips = []
             st.session_state.processing_complete = False
@@ -701,7 +740,6 @@ def main():
                 st.error("Video file not found. Please reload.")
                 return
                 
-            # Progress tracking
             progress_bar = st.progress(0)
             status_text = st.empty()
             
@@ -724,10 +762,9 @@ def main():
                 status_text.text("🎤 Transcribing audio...")
                 progress_bar.progress(25)
                 
-                transcript = transcribe_audio_simple(video_path, client)
+                transcript = transcribe_audio(video_path, client)
                 st.success("✅ Transcription complete")
                 
-                # Show transcript
                 progress_bar.progress(50)
                 with st.expander("📄 Transcript Preview", expanded=False):
                     st.text_area("Full Transcript", transcript, height=200, disabled=True)
@@ -739,7 +776,6 @@ def main():
                 ai_json = analyze_transcript(transcript, platform, selected_parameters, client, video_duration)
                 st.success("✅ Analysis complete")
 
-                # Show AI output
                 with st.expander("🔍 AI Analysis Output", expanded=False):
                     st.code(ai_json, language="json")
 
@@ -750,11 +786,8 @@ def main():
                 segments = parse_segments(ai_json, video_duration)
                 if not segments:
                     st.warning("⚠️ No valid segments found.")
-                    progress_bar.progress(100)
-                    status_text.text("❌ No segments found")
                     return
                     
-                # Sort by score
                 segments_sorted = sorted(segments, key=lambda x: x.get('score', 0), reverse=True)
                 
                 # Step 5: Generate clips
@@ -765,13 +798,11 @@ def main():
 
                 st.markdown("---")
                 st.header("🎬 Creating Clips")
-                st.info("🚀 Generating clips in original format for maximum compatibility")
+                st.info("🚀 Generating clips using frame extraction method")
                 
-                # Generate clips
-                all_clips = create_clips_moviepy(video_path, segments_sorted, make_vertical)
+                all_clips = create_clips_one_by_one(video_path, segments_sorted)
                 
                 if all_clips:
-                    # Store in session state
                     st.session_state.all_clips = all_clips
                     st.session_state.clips_generated = True
                     st.session_state.processing_complete = True
@@ -779,35 +810,26 @@ def main():
                     progress_bar.progress(100)
                     status_text.text("✅ All clips generated successfully!")
                     
-                    st.success(f"🎉 Generated {len(all_clips)} clips!")
+                    st.success(f"🎉 Generated {len(all_clips)} video clips!")
                     
-                    # Force cleanup
                     gc.collect()
-                    
-                    # Trigger rerun to show clips
                     st.rerun()
                 else:
                     st.warning("❌ No clips were generated successfully.")
-                    progress_bar.progress(100)
-                    status_text.text("❌ Clip generation failed")
                     return
                     
             except Exception as e:
                 st.error("❌ Processing failed")
                 st.error(f"Error: {str(e)}")
                 
-                # Show detailed error for debugging
                 with st.expander("🔍 Error Details", expanded=False):
                     st.code(traceback.format_exc())
                 
-                progress_bar.progress(0)
-                status_text.text("❌ Processing failed")
                 return
 
     # Sidebar reset
     st.sidebar.markdown("---")
     if st.sidebar.button("🔄 Start Over", help="Clear all data"):
-        # Clean up clip files
         if 'all_clips' in st.session_state:
             for clip in st.session_state.all_clips:
                 try:
@@ -816,11 +838,9 @@ def main():
                 except:
                     pass
         
-        # Clear session state
         for key in list(st.session_state.keys()):
             del st.session_state[key]
         
-        # Force cleanup
         gc.collect()
         st.rerun()
 
