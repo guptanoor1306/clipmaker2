@@ -281,7 +281,7 @@ def parse_segments(text: str, video_duration: float = None) -> list:
 
 
 def create_clips_moviepy(video_path: str, segments: list, make_vertical: bool = False) -> list:
-    """Create clips using MoviePy with robust settings."""
+    """Create clips using MoviePy with robust error handling."""
     clips = []
     main_video = None
     
@@ -318,38 +318,53 @@ def create_clips_moviepy(video_path: str, segments: list, make_vertical: bool = 
                     st.warning(f"Skipping clip {i}: Too short")
                     continue
                 
-                # Create subclip
-                clip = main_video.subclipped(start_time, end_time)
+                # Create subclip with error handling
+                try:
+                    clip = main_video.subclipped(start_time, end_time)
+                    st.info(f"Subclip created for clip {i}")
+                except Exception as subclip_error:
+                    st.error(f"Failed to create subclip {i}: {str(subclip_error)}")
+                    continue
                 
-                # Skip vertical processing for now to ensure compatibility
+                # Skip vertical processing for compatibility
                 if make_vertical:
-                    st.info(f"Vertical format requested but disabled for compatibility - clip {i} will be in original format")
+                    st.info(f"Vertical format disabled for compatibility - clip {i} will be original format")
                 
-                # Create temp file
-                temp_file = tempfile.NamedTemporaryFile(
-                    delete=False, 
-                    suffix=".mp4",
-                    prefix=f"clip_{i}_"
-                )
-                temp_file.close()
+                # Create temp file with better error handling
+                try:
+                    temp_file = tempfile.NamedTemporaryFile(
+                        delete=False, 
+                        suffix=".mp4",
+                        prefix=f"clip_{i}_"
+                    )
+                    temp_file_path = temp_file.name
+                    temp_file.close()
+                    st.info(f"Temp file created: {temp_file_path}")
+                except Exception as temp_error:
+                    st.error(f"Failed to create temp file for clip {i}: {str(temp_error)}")
+                    continue
                 
-                # Write with reliable settings
-                clip.write_videofile(
-                    temp_file.name,
-                    codec='libx264',
-                    audio_codec='aac',
-                    temp_audiofile_path=None,
-                    remove_temp=False,
-                    bitrate="2000k",
-                    fps=24
-                )
+                # Write with minimal settings for reliability
+                try:
+                    st.info(f"Writing clip {i} to file...")
+                    clip.write_videofile(temp_file_path)
+                    st.info(f"Clip {i} written successfully")
+                except Exception as write_error:
+                    st.error(f"Failed to write clip {i}: {str(write_error)}")
+                    # Clean up failed temp file
+                    try:
+                        if os.path.exists(temp_file_path):
+                            os.unlink(temp_file_path)
+                    except:
+                        pass
+                    continue
                 
                 # Verify file was created
-                if os.path.isfile(temp_file.name) and os.path.getsize(temp_file.name) > 0:
+                if os.path.isfile(temp_file_path) and os.path.getsize(temp_file_path) > 0:
                     format_info = f"{original_width}x{original_height} Original"
                     
                     clips.append({
-                        "path": temp_file.name,
+                        "path": temp_file_path,
                         "caption": seg.get("caption", f"clip_{i}"),
                         "score": seg.get("score", 0),
                         "reason": seg.get("reason", ""),
@@ -361,12 +376,19 @@ def create_clips_moviepy(video_path: str, segments: list, make_vertical: bool = 
                         "format": format_info,
                         "index": i
                     })
-                    st.success(f"✅ Created clip {i}")
+                    st.success(f"✅ Created clip {i} ({os.path.getsize(temp_file_path)} bytes)")
                 else:
-                    st.error(f"Failed to create clip {i}: File not generated")
+                    st.error(f"Failed to create clip {i}: File not generated or empty")
+                    # Clean up empty temp file
+                    try:
+                        if os.path.exists(temp_file_path):
+                            os.unlink(temp_file_path)
+                    except:
+                        pass
                 
             except Exception as e:
                 st.error(f"Error creating clip {i}: {str(e)}")
+                st.error(f"Error type: {type(e).__name__}")
                 continue
             finally:
                 # Always clean up clip
@@ -383,6 +405,7 @@ def create_clips_moviepy(video_path: str, segments: list, make_vertical: bool = 
         
     except Exception as e:
         st.error(f"Error in clip generation: {str(e)}")
+        st.error(f"Error type: {type(e).__name__}")
         raise
     finally:
         # Always clean up main video
