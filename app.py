@@ -77,13 +77,19 @@ PRIORITIZE CONTENT THAT MATCHES THE SELECTED PARAMETERS ABOVE. Focus your analys
 
 For each recommended cut, provide:
 1. Start and end timestamps (HH:MM:SS format) - MUST be within video duration
-2. Reason why this segment will work (focusing on hook strength, selected parameters, and complete ending)
-3. Predicted engagement score (0–100) — your confidence in performance
-4. Suggested caption for social media with emojis/hashtags
+2. Hook: The exact opening words/question that grabs attention (first 1-3 seconds)
+3. Flow: Detailed narrative structure (e.g., "Hook → Context → Pivot → CTA")
+4. Focus parameters: Which of the selected parameters this clip excels in
+5. Reason why this segment will work (focusing on hook strength, selected parameters, and complete ending)
+6. Predicted engagement score (0–100) — your confidence in performance
+7. Suggested caption for social media with emojis/hashtags
 
 Output ONLY valid JSON as an array of objects with these exact keys:
 - start: "HH:MM:SS"
 - end: "HH:MM:SS" 
+- hook: "exact opening words/question that starts the clip"
+- flow: "detailed narrative structure (Hook → Context → Pivot → etc.)"
+- focus_parameters: ["parameter1", "parameter2"] (which selected parameters this clip focuses on)
 - reason: "brief rationale focusing on hook strength, selected parameters, virality factors, and proper ending"
 - score: integer (0-100)
 - caption: "social media caption with emojis and hashtags"
@@ -93,9 +99,12 @@ Example format:
   {{
     "start": "00:02:15",
     "end": "00:02:45",
-    "reason": "Opens with shocking statistic that hooks immediately, myth-busts credit score beliefs (Educational Value + Surprise Factor), ends with complete actionable advice",
+    "hook": "Did you know your credit score is basically meaningless?",
+    "flow": "Hook (Question) → Shocking claim → Myth debunking → Alternative approach → Action step",
+    "focus_parameters": ["Educational Value", "Surprise Factor"],
+    "reason": "Opens with shocking question that hooks immediately, myth-busts credit score beliefs (Educational Value + Surprise Factor), ends with complete actionable advice",
     "score": 88,
-    "caption": "Wait... credit scores don't work how you think?! 😱 #MoneyMyths #FinanceTips #CreditScore"
+    "caption": "Did you know your credit score is basically meaningless? 😱 #MoneyMyths #FinanceTips #CreditScore"
   }}
 ]"""
 
@@ -240,7 +249,8 @@ def parse_segments(text: str, video_duration: float = None) -> list:
         valid_segments = []
         
         for i, seg in enumerate(segments):
-            if all(key in seg for key in ["start", "end", "reason", "score", "caption"]):
+            required_keys = ["start", "end", "hook", "flow", "focus_parameters", "reason", "score", "caption"]
+            if all(key in seg for key in required_keys):
                 try:
                     start_seconds = time_to_seconds(seg["start"])
                     end_seconds = time_to_seconds(seg["end"])
@@ -269,6 +279,41 @@ def parse_segments(text: str, video_duration: float = None) -> list:
                     valid_segments.append(seg)
                 except:
                     continue
+            else:
+                # Try to handle old format without new fields
+                if all(key in seg for key in ["start", "end", "reason", "score", "caption"]):
+                    # Add default values for missing fields
+                    seg["hook"] = seg.get("hook", "Hook not specified")
+                    seg["flow"] = seg.get("flow", "Flow structure not specified")
+                    seg["focus_parameters"] = seg.get("focus_parameters", ["General"])
+                    
+                    try:
+                        start_seconds = time_to_seconds(seg["start"])
+                        end_seconds = time_to_seconds(seg["end"])
+                        
+                        if video_duration:
+                            if start_seconds >= video_duration:
+                                continue
+                            if end_seconds > video_duration:
+                                end_minutes = int(video_duration // 60)
+                                end_secs = int(video_duration % 60)
+                                seg["end"] = f"{end_minutes//60:02d}:{end_minutes%60:02d}:{end_secs:02d}"
+                        
+                        if start_seconds >= end_seconds:
+                            continue
+                        if end_seconds - start_seconds < 15:
+                            continue
+                        if end_seconds - start_seconds > 60:
+                            new_end_seconds = start_seconds + 60
+                            if video_duration and new_end_seconds > video_duration:
+                                new_end_seconds = video_duration
+                            end_minutes = int(new_end_seconds // 60)
+                            end_secs = int(new_end_seconds % 60)
+                            seg["end"] = f"{end_minutes//60:02d}:{end_minutes%60:02d}:{end_secs:02d}"
+                        
+                        valid_segments.append(seg)
+                    except:
+                        continue
         
         return valid_segments
     except json.JSONDecodeError as e:
@@ -342,6 +387,9 @@ def generate_clips(video_path: str, segments: list) -> list:
                 if os.path.isfile(temp_file.name) and os.path.getsize(temp_file.name) > 0:
                     clips.append({
                         "path": temp_file.name, "caption": caption, "score": score, "reason": reason,
+                        "hook": seg.get("hook", "Hook not specified"),
+                        "flow": seg.get("flow", "Flow not specified"), 
+                        "focus_parameters": seg.get("focus_parameters", ["General"]),
                         "start": seg.get("start"), "end": seg.get("end"), 
                         "duration": f"{end_time - start_time:.1f}s"
                     })
@@ -400,7 +448,7 @@ def display_clips(clips: list, platform: str, start_index: int = 0, max_clips: i
     clips_to_show = clips[start_index:start_index + max_clips]
     
     for i, clip in enumerate(clips_to_show, start=start_index + 1):
-        clip_key = f"clip_{start_index}_{i}"
+        clip_key = f"clip_{start_index}_{i}_{hash(str(clip))}"  # More unique key to prevent conflicts
         col1, col2 = st.columns([2, 1])
         
         with col1:
@@ -422,18 +470,43 @@ def display_clips(clips: list, platform: str, start_index: int = 0, max_clips: i
             st.write(f"⏱️ **Duration:** {clip.get('duration', 'N/A')}")
             st.write(f"🕐 **Time:** {clip.get('start', 'N/A')} - {clip.get('end', 'N/A')}")
             st.write(f"🎯 **Score:** {clip.get('score', 0)}/100")
+            
+            # New detailed breakdown
+            st.markdown("**🪝 0-Second Hook:**")
+            hook_text = clip.get('hook', 'Hook not specified')
+            st.write(f"*\"{hook_text}\"*")
+            
+            st.markdown("**🎬 Content Flow:**")
+            flow_text = clip.get('flow', 'Flow structure not specified')
+            st.write(flow_text)
+            
+            st.markdown("**🎯 Focus Parameters:**")
+            focus_params = clip.get('focus_parameters', ['General'])
+            if isinstance(focus_params, list):
+                for param in focus_params:
+                    st.write(f"• {param}")
+            else:
+                st.write(f"• {focus_params}")
+            
             st.markdown("**💡 Why this will work:**")
             st.write(clip.get('reason', 'No reason provided'))
             
+            # Download button with improved state handling
             video_path = clip.get("path")
             if video_path and os.path.isfile(video_path):
                 try:
                     with open(video_path, "rb") as file:
                         file_data = file.read()
+                        # Use a more stable key that won't cause state resets
+                        unique_key = f"dl_{i}_{abs(hash(video_path)) % 10000}"
                         st.download_button(
-                            label="⬇️ Download Clip", data=file_data,
+                            label="⬇️ Download Clip", 
+                            data=file_data,
                             file_name=f"clip_{i}_{platform.replace(' ', '_').lower()}.mp4",
-                            mime="video/mp4", use_container_width=True, key=f"download_{clip_key}"
+                            mime="video/mp4", 
+                            use_container_width=True, 
+                            key=unique_key,
+                            help="Click to download this clip"
                         )
                 except Exception:
                     st.error(f"Error preparing download for clip {i}")
@@ -601,7 +674,10 @@ def main():
         if remaining_clips > 0:
             col1, col2, col3 = st.columns([1, 2, 1])
             with col2:
-                if st.button(f"🎬 Show Next {min(5, remaining_clips)} Clips", type="primary", use_container_width=True):
+                # Use a unique key that doesn't conflict with download buttons
+                show_more_key = f"show_more_{st.session_state.clips_shown}_{len(st.session_state.all_clips)}"
+                if st.button(f"🎬 Show Next {min(5, remaining_clips)} Clips", 
+                           type="primary", use_container_width=True, key=show_more_key):
                     st.rerun()
         
         # Summary stats
@@ -617,7 +693,8 @@ def main():
             col4.metric("Platform", platform)
         
         # Reset button
-        if st.button("🔄 Clear All Clips & Start Over", type="secondary"):
+        reset_key = f"reset_{len(st.session_state.all_clips)}_{st.session_state.clips_shown}"
+        if st.button("🔄 Clear All Clips & Start Over", type="secondary", key=reset_key):
             for clip in st.session_state.all_clips:
                 try:
                     if clip.get("path") and os.path.isfile(clip["path"]):
