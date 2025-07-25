@@ -4,6 +4,7 @@ import json
 import tempfile
 import traceback
 import re
+import time
 import streamlit as st
 from moviepy.video.io.VideoFileClip import VideoFileClip
 import gdown
@@ -448,7 +449,6 @@ def display_clips(clips: list, platform: str, start_index: int = 0, max_clips: i
     clips_to_show = clips[start_index:start_index + max_clips]
     
     for i, clip in enumerate(clips_to_show, start=start_index + 1):
-        clip_key = f"clip_{start_index}_{i}_{hash(str(clip))}"  # More unique key to prevent conflicts
         col1, col2 = st.columns([2, 1])
         
         with col1:
@@ -491,25 +491,28 @@ def display_clips(clips: list, platform: str, start_index: int = 0, max_clips: i
             st.markdown("**💡 Why this will work:**")
             st.write(clip.get('reason', 'No reason provided'))
             
-            # Download button with improved state handling
+            # Download button with stable key that doesn't cause rerun
             video_path = clip.get("path")
             if video_path and os.path.isfile(video_path):
                 try:
                     with open(video_path, "rb") as file:
                         file_data = file.read()
-                        # Use a more stable key that won't cause state resets
-                        unique_key = f"dl_{i}_{abs(hash(video_path)) % 10000}"
-                        st.download_button(
-                            label="⬇️ Download Clip", 
-                            data=file_data,
-                            file_name=f"clip_{i}_{platform.replace(' ', '_').lower()}.mp4",
-                            mime="video/mp4", 
-                            use_container_width=True, 
-                            key=unique_key,
-                            help="Click to download this clip"
-                        )
-                except Exception:
-                    st.error(f"Error preparing download for clip {i}")
+                        # Create a super stable key that includes session info
+                        stable_key = f"dl_{st.session_state.session_id}_{i}_{abs(hash(video_path)) % 1000}"
+                        
+                        # Add a small container to isolate the download button
+                        with st.container():
+                            st.download_button(
+                                label="⬇️ Download Clip", 
+                                data=file_data,
+                                file_name=f"clip_{i}_{platform.replace(' ', '_').lower()}.mp4",
+                                mime="video/mp4", 
+                                use_container_width=True, 
+                                key=stable_key,
+                                help="Download this clip to your device"
+                            )
+                except Exception as e:
+                    st.error(f"Error preparing download for clip {i}: {str(e)}")
             else:
                 st.error("❌ File not available for download")
         
@@ -535,6 +538,8 @@ def main():
         st.session_state.clips_shown = 0
     if 'processing_complete' not in st.session_state:
         st.session_state.processing_complete = False
+    if 'session_id' not in st.session_state:
+        st.session_state.session_id = hash(str(time.time())) % 100000  # Unique session identifier
 
     # API Key validation
     API_KEY = get_api_key()
